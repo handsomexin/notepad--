@@ -1,0 +1,162 @@
+<Window x:Class="SmartTextEditor.Windows.FileCompareWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="文件对比" Height="700" Width="1200"
+        MinHeight="500" MinWidth="800"
+        Background="#0D1117"
+        WindowStartupLocation="CenterOwner">
+    
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        
+        <!-- 工具栏 -->
+        <ToolBar Grid.Row="0" Background="#161B22" Height="50">
+            <Button Content="📁 加载左侧文件" Padding="12,8" Margin="4,2"
+                    Background="#238636" Foreground="White" BorderThickness="0"
+                    Click="LoadLeftFile_Click" ToolTip="加载左侧对比文件"/>
+            <Button Content="📂 加载右侧文件" Padding="12,8" Margin="4,2"
+                    Background="#238636" Foreground="White" BorderThickness="0"
+                    Click="LoadRightFile_Click" ToolTip="加载右侧对比文件"/>
+            
+            <Separator Margin="12,4"/>
+            
+            <Button Content="🔄 开始对比" Padding="12,8" Margin="4,2"
+                    Background="#58A6FF" Foreground="White" BorderThickness="0"
+                    Click="StartCompare_Click" ToolTip="开始对比文件"/>
+            <Button Content="🧹 清除标记" Padding="12,8" Margin="4,2"
+                    Background="#21262D" Foreground="#E6EDF3" BorderBrush="#30363D" BorderThickness="1"
+                    Click="ClearHighlight_Click" ToolTip="清除所有对比标记"/>
+            
+            <Separator Margin="12,4"/>
+            
+            <Button Content="📋 从剪贴板粘贴到左侧" Padding="12,8" Margin="4,2"
+                    Background="#D29922" Foreground="White" BorderThickness="0"
+                    Click="PasteToLeft_Click" ToolTip="从剪贴板粘贴内容到左侧"/>
+            <Button Content="📋 从剪贴板粘贴到右侧" Padding="12,8" Margin="4,2"
+                    Background="#D29922" Foreground="White" BorderThickness="0"
+                    Click="PasteToRight_Click" ToolTip="从剪贴板粘贴内容到右侧"/>
+        </ToolBar>
+        
+        <!-- 文件信息栏 -->
+        <Grid Grid.Row="1" Background="#161B22" Height="35">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            
+            <TextBlock x:Name="LeftFileInfo" Grid.Column="0" 
+                       Text="左侧: 未加载文件" 
+                       Foreground="#E6EDF3" FontWeight="Medium"
+                       Margin="12,8" VerticalAlignment="Center"/>
+            
+            <TextBlock x:Name="RightFileInfo" Grid.Column="1" 
+                       Text="右侧: 未加载文件" 
+                       Foreground="#E6EDF3" FontWeight="Medium"
+                       Margin="12,8" VerticalAlignment="Center"/>
+        </Grid>
+        
+        <!-- 对比编辑器区域 -->
+        <Grid Grid.Row="2" Margin="5">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="5"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            
+            <!-- 左侧编辑器 -->
+            <Grid Grid.Column="0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="35"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                
+                <!-- 左侧行号 -->
+                <TextBox x:Name="LeftLineNumbers" Grid.Column="0"
+                         Background="#161B22" Foreground="#7D8590"
+                         BorderThickness="0,0,1,0" BorderBrush="#30363D"
+                         FontFamily="Consolas" FontSize="13"
+                         IsReadOnly="True" IsTabStop="False"
+                         VerticalScrollBarVisibility="Hidden"
+                         HorizontalScrollBarVisibility="Hidden"
+                         TextAlignment="Right" Padding="8,12,8,12"/>
+                
+                <!-- 左侧文本编辑器 -->
+                <RichTextBox x:Name="LeftTextEditor" Grid.Column="1"
+                             Background="#0D1117" Foreground="#E6EDF3"
+                             BorderBrush="#30363D" BorderThickness="1"
+                             FontFamily="Consolas" FontSize="14" Padding="12"
+                             AcceptsReturn="True" AcceptsTab="True"
+                             VerticalScrollBarVisibility="Auto"
+                             HorizontalScrollBarVisibility="Auto"
+                             TextChanged="LeftTextEditor_TextChanged"
+                             ScrollViewer.ScrollChanged="LeftTextEditor_ScrollChanged"/>
+            </Grid>
+            
+            <!-- 分隔线 -->
+            <Border Grid.Column="1" Background="#30363D"/>
+            
+            <!-- 右侧编辑器 -->
+            <Grid Grid.Column="2">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="35"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                
+                <!-- 右侧行号 -->
+                <TextBox x:Name="RightLineNumbers" Grid.Column="0"
+                         Background="#161B22" Foreground="#7D8590"
+                         BorderThickness="0,0,1,0" BorderBrush="#30363D"
+                         FontFamily="Consolas" FontSize="13"
+                         IsReadOnly="True" IsTabStop="False"
+                         VerticalScrollBarVisibility="Hidden"
+                         HorizontalScrollBarVisibility="Hidden"
+                         TextAlignment="Right" Padding="8,12,8,12"/>
+                
+                <!-- 右侧文本编辑器 -->
+                <RichTextBox x:Name="RightTextEditor" Grid.Column="1"
+                             Background="#0D1117" Foreground="#E6EDF3"
+                             BorderBrush="#30363D" BorderThickness="1"
+                             FontFamily="Consolas" FontSize="14" Padding="12"
+                             AcceptsReturn="True" AcceptsTab="True"
+                             VerticalScrollBarVisibility="Auto"
+                             HorizontalScrollBarVisibility="Auto"
+                             TextChanged="RightTextEditor_TextChanged"
+                             ScrollViewer.ScrollChanged="RightTextEditor_ScrollChanged"/>
+            </Grid>
+        </Grid>
+        
+        <!-- 状态栏 -->
+        <StatusBar Grid.Row="3" Background="#161B22" Foreground="#E6EDF3" Height="36">
+            <StatusBarItem>
+                <StackPanel Orientation="Horizontal">
+                    <Ellipse x:Name="CompareStatusIndicator" Width="12" Height="12" 
+                             Fill="#7D8590" Margin="0,0,10,0"/>
+                    <TextBlock x:Name="CompareStatusText" Text="准备对比" Foreground="#E6EDF3" 
+                               FontWeight="Medium" VerticalAlignment="Center"/>
+                </StackPanel>
+            </StatusBarItem>
+            
+            <StatusBarItem HorizontalAlignment="Right">
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock x:Name="DifferenceCountText" Text="差异: 0" 
+                               Foreground="#E6EDF3" Margin="0,0,16,0" 
+                               FontWeight="Medium" VerticalAlignment="Center"/>
+                    <TextBlock x:Name="CompareInfoText" Text="行数: 左0 | 右0" 
+                               Foreground="#7D8590" Margin="0,0,16,0" 
+                               FontWeight="Medium" VerticalAlignment="Center"/>
+                </StackPanel>
+            </StatusBarItem>
+        </StatusBar>
+    </Grid>
+    
+    <!-- 快捷键绑定 -->
+    <Window.InputBindings>
+        <KeyBinding Key="F5" Command="{x:Static ApplicationCommands.Replace}"/>
+        <KeyBinding Key="Escape" Command="{x:Static ApplicationCommands.Close}"/>
+    </Window.InputBindings>
+</Window>

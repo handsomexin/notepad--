@@ -1,0 +1,2470 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Threading;
+using Microsoft.Win32;
+using SmartTextEditor.Services;
+using SmartTextEditor.Models;
+using SmartTextEditor.Windows;
+using SmartTextEditor.Themes;
+using System.IO.Compression;
+
+namespace SmartTextEditor
+{
+    /// <summary>
+    /// MainWindow.xaml 的交互逻辑 - 支持多标签页 - 极速启动优化
+    /// </summary>
+    public partial class MainWindow : Window
+    {
+        // 延迟初始化的服务
+        private EncodingDetector _encodingDetector;
+        private DispatcherTimer _autoCacheTimer;
+        private readonly string _cacheDirectory = Path.Combine(Directory.GetCurrentDirectory(), "Cache");
+        private readonly ObservableCollection<FileTabItem> _tabItems;
+        private FileTabItem _currentTab;
+        private int _newFileCounter = 1;
+        private bool _isFullyInitialized = false;
+        
+        // 添加主题预览相关字段
+        private ThemeType _previewTheme = ThemeType.Dark;
+        private bool _isPreviewingTheme = false;
+        
+        // 添加大文件处理优化字段
+        private const int LARGE_FILE_THRESHOLD = 50000; // 50KB阈值
+        private const int HUGE_FILE_THRESHOLD = 1000000; // 1MB阈值
+        
+        // 添加缓存优化字段
+        private const int CACHE_COMPRESS_THRESHOLD = 50000; // 50KB阈값
+        private const int CACHE_CLEANUP_INTERVAL = 7; // 7天清理一次
+        private readonly object _cacheLock = new object(); // 缓存操作锁
+
+        public MainWindow()
+        {
+            // 极简初始化，只做必要的UI初始化
+            InitializeComponent();
+            _tabItems = new ObservableCollection<FileTabItem>();
+            
+            // 设置窗口基本属性（延迟到显示后）
+            this.Title = "Smart Text Editor";
+            
+            // 加载保存的窗口设置
+            LoadWindowSettings();
+            
+            // 创建最简单的欢迎标签页
+            CreateMinimalWelcomeTab();
+        }
+
+        private void LoadWindowSettings()
+        {
+            try
+            {
+                var config = ConfigManager.LoadConfig();
+                if (config.RememberWindowSize)
+                {
+                    this.Width = config.WindowWidth;
+                    this.Height = config.WindowHeight;
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"加载窗口设置失败: {ex.Message}");
+            }
+        }
+
+        private async Task RestoreLastSession()
+        {
+            try
+            {
+                var (sessionTabs, activeTabIndex) = ConfigManager.LoadSession();
+                
+                if (sessionTabs == null || sessionTabs.Count == 0)
+                {
+                    System.Diagnostics.Debug.WriteLine("没有上次会话需要恢复");
+                    return;
+                }
+
+                // 移除默认欢迎标签页（如果存在）
+                if (_tabItems.Count > 0 && _tabItems[0].FileName == "欢迎")
+                {
+                    var welcomeTab = _tabItems[0];
+                    _tabItems.RemoveAt(0);
+                    
+                    var tabControl = FileTabControl;
+                    if (tabControl?.Items.Count > 0)
+                    {
+                        tabControl.Items.RemoveAt(0);
+                    }
+                }
+
+                // 恢复每个标签页
+                for (int i = 0; i < sessionTabs.Count; i++)
+                {
+                    var sessionTab = sessionTabs[i];
+                    await RestoreTabFromSession(sessionTab);
+                }
+
+                // 设置活跃标签页
+                if (activeTabIndex >= 0 && activeTabIndex < _tabItems.Count)
+                {
+                    SwitchToTab(_tabItems[activeTabIndex]);
+                }
+                else if (_tabItems.Count > 0)
+                {
+                    SwitchToTab(_tabItems[0]);
+                }
+
+                UpdateStatus($"已恢复上次会话：{sessionTabs.Count}个标签页");
+                System.Diagnostics.Debug.WriteLine($"会话恢复完成：{sessionTabs.Count}个标签页");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"恢复会话失败: {ex.Message}");
+                UpdateStatus("恢复上次会话失败");
+            }
+        }
+
+        private async Task RestoreTabFromSession(ConfigManager.SessionTab sessionTab)
+        {
+            try
+            {
+                await Task.Run(() =>
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        // 如果有文件路径且文件存在，尝试重新加载文件
+                        if (!string.IsNullOrEmpty(sessionTab.FilePath) && File.Exists(sessionTab.FilePath))
+                        {
+                            try
+                            {
+                                // 读取最新文件内容
+                                var encoding = GetEncodingByName(sessionTab.Encoding);
+                                var currentContent = File.ReadAllText(sessionTab.FilePath, encoding);
+                                
+                                // 如果文件内容没有变化或者会话中有未保存的修改，使用会话内容
+                                var contentToUse = sessionTab.IsModified ? sessionTab.Content : currentContent;
+                                CreateTabFromSession(sessionTab, contentToUse);
+                            }
+                            catch (Exception ex)
+                            {
+                                System.Diagnostics.Debug.WriteLine($"读取文件失败，使用会话内容: {ex.Message}");
+                                CreateTabFromSession(sessionTab, sessionTab.Content);
+                            }
+                        }
+                        else
+                        {
+                            // 文件不存在或是新文件，使用会话中的内容
+                            CreateTabFromSession(sessionTab, sessionTab.Content);
+                        }
+                    });
+                });
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"恢复标签页失败: {ex.Message}");
+            }
+        }
+
+        private void CreateTabFromSession(ConfigManager.SessionTab sessionTab, string content)
+        {
+            try
+            {
+                // 创建标签页
+                CreateNewTab(sessionTab.FileName, content);
+                
+                // 获取刚创建的标签页
+                var newTab = _tabItems.LastOrDefault();
+                if (newTab != null)
+                {
+                    // 恢复属性
+                    newTab.FilePath = sessionTab.FilePath;
+                    newTab.Encoding = sessionTab.Encoding;
+                    
+                    // 设置原始内容和当前内容来恢复修改状态
+                    newTab.OriginalContent = sessionTab.IsModified ? "" : content;
+                    newTab.Content = content;
+                    
+                    // 恢复光标位置和选择
+                    if (newTab.TextEditor != null)
+                    {
+                        newTab.TextEditor.CaretIndex = Math.Min(sessionTab.CursorPosition, content.Length);
+                        if (sessionTab.SelectionLength > 0)
+                        {
+                            var selStart = Math.Min(sessionTab.SelectionStart, content.Length);
+                            var selLength = Math.Min(sessionTab.SelectionLength, content.Length - selStart);
+                            newTab.TextEditor.Select(selStart, selLength);
+                        }
+                    }
+                    
+                    // 更新标题和状态
+                    UpdateTabHeader(newTab);
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"从会话创建标签页失败: {ex.Message}");
+            }
+        }
+
+        private Encoding GetEncodingByName(string encodingName)
+        {
+            try
+            {
+                return encodingName.ToUpper() switch
+                {
+                    "UTF-8" => Encoding.UTF8,
+                    "GBK" => Encoding.GetEncoding("GBK"),
+                    "UTF-16" => Encoding.Unicode,
+                    "ASCII" => Encoding.ASCII,
+                    _ => Encoding.UTF8
+                };
+            }
+            catch
+            {
+                return Encoding.UTF8;
+            }
+        }
+        
+        /// <summary>
+        /// 异步完成剩余的初始化工作
+        /// </summary>
+        public async Task CompleteInitializationAsync()
+        {
+            if (_isFullyInitialized) return;
+            
+            try
+            {
+                await Dispatcher.InvokeAsync(async () =>
+                {
+                    // 延迟初始化服务
+                    await Task.Run(() =>
+                    {
+                        _encodingDetector = new EncodingDetector();
+                    });
+                    
+                    // 初始化编辑器功能
+                    InitializeEditor();
+                    
+                    // 初始化自动缓存
+                    InitializeAutoCache();
+                    
+                    // 完善欢迎页内容
+                    CompleteWelcomeTab();
+                    
+                    // 初始化主题系统
+                    InitializeThemeSystem();
+                    
+                    // 恢复上次会话
+                    await RestoreLastSession();
+                    
+                    _isFullyInitialized = true;
+                    
+                    // 更新状态
+                    UpdateStatus("就绪 - 所有功能已加载");
+                });
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"初始化失败: {ex.Message}");
+            }
+        }
+
+        #region 初始化
+
+        private void CreateMinimalWelcomeTab()
+        {
+            // 极简欢迎页，只显示基本信息
+            var welcomeContent = "🚀 Smart Text Editor - 正在加载...";
+
+            var welcomeTab = new FileTabItem
+            {
+                FileName = "欢迎",
+                Content = welcomeContent
+            };
+            welcomeTab.OriginalContent = welcomeContent;
+
+            _tabItems.Add(welcomeTab);
+            _currentTab = welcomeTab;
+
+            // 简单设置欢迎页内容（无事件绑定）
+            if (WelcomeTextEditor != null)
+            {
+                WelcomeTextEditor.Text = welcomeContent;
+            }
+            if (WelcomeLineNumbers != null)
+            {
+                WelcomeLineNumbers.Text = "1";
+            }
+        }
+        
+        private void CompleteWelcomeTab()
+        {
+            // 在异步初始化后完善欢迎页内容
+            var fullWelcomeContent = @"🎉 欢迎使用 Smart Text Editor v1.3！
+
+✨ 最新功能 - 智能会话恢复：
+• 会话自动保存 - 关闭程序时自动保存所有标签页
+• 无缝恢复体验 - 重启后完全恢复工作状态
+• 智能状态保持 - 文件内容、修改状态、光标位置
+• 编码格式记忆 - 各文件编码设置完整保留
+• 异常情况处理 - 文件移动删除的智能处理
+
+🎨 多主题系统：
+• 6种精美主题 - 适应不同使用场景
+• 智能主题记忆 - 程序记住您的主题选择
+• 自动保存设置 - 下次启动自动应用
+• 窗口大小记忆 - 保持您喜欢的界面布局
+
+💾 会话恢复特性：
+• 标签页完整恢复 - 所有打开的文件自动恢复
+• 编辑状态保持 - 光标位置、文本选择状态
+• 修改状态记忆 - 未保存修改的完整保留
+• 活跃标签恢复 - 恢复到关闭前的工作标签
+• 混合文件支持 - 新文件、已保存文件统一处理
+
+⌨️ 操作指南：
+• 正常编辑工作，程序会自动记录状态
+• 关闭程序时会自动保存当前会话
+• 重新启动时自动恢复到上次的工作状态
+• 配置文件：%LOCALAPPDATA%\SmartTextEditor\
+
+⌨️ 快捷键：
+• Ctrl+N - 新建标签页
+• Ctrl+O - 打开文件
+• Ctrl+S - 保存文件
+• Ctrl+D - 文件对比
+• Ctrl+Tab - 切换标签页
+
+🚀 享受无缝的工作体验吧！";
+
+            if (_currentTab != null && _currentTab.FileName == "欢迎")
+            {
+                _currentTab.Content = fullWelcomeContent;
+                _currentTab.OriginalContent = fullWelcomeContent;
+                WelcomeTextEditor.Text = fullWelcomeContent;
+                
+                // 设置事件处理
+                WelcomeTextEditor.TextChanged += (s, e) => OnCurrentTabTextChanged();
+                WelcomeTextEditor.SelectionChanged += (s, e) => {
+                    UpdateCursorPosition();
+                    UpdateSelectionInfo();
+                };
+                WelcomeTextEditor.PreviewKeyDown += TextEditor_PreviewKeyDown;
+                
+                UpdateLineNumbers(WelcomeLineNumbers, WelcomeTextEditor);
+                UpdateCursorPosition();
+                UpdateSelectionInfo();
+            }
+        }
+
+        private void InitializeEditor()
+        {
+            try
+            {
+                UpdateTitle();
+                this.CommandBindings.Add(new CommandBinding(ApplicationCommands.New, (s, e) => NewFile()));
+                this.CommandBindings.Add(new CommandBinding(ApplicationCommands.Open, (s, e) => OpenFile()));
+                this.CommandBindings.Add(new CommandBinding(ApplicationCommands.Save, (s, e) => SaveFile()));
+                this.CommandBindings.Add(new CommandBinding(ApplicationCommands.Properties, (s, e) => FileCompare()));
+                this.CommandBindings.Add(new CommandBinding(ApplicationCommands.Find, (s, e) => ShowFindDialog()));
+                this.CommandBindings.Add(new CommandBinding(ApplicationCommands.Replace, (s, e) => ShowFindReplaceDialog()));
+                this.CommandBindings.Add(new CommandBinding(NavigationCommands.Search, (s, e) => FindNext()));
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"编辑器初始化失败: {ex.Message}");
+            }
+        }
+
+        private void InitializeThemeSystem()
+        {
+            try
+            {
+                // 加载保存的主题设置
+                var savedTheme = ConfigManager.LoadTheme();
+                
+                // 设置主题
+                ThemeManager.SetTheme(savedTheme);
+                var themeColors = ThemeManager.GetCurrentThemeColors();
+
+                // 应用主题到主窗口
+                ThemeApplier.ApplyThemeToMainWindow(this, themeColors);
+
+                // 应用主题到所有标签页
+                foreach (var tabItem in _tabItems)
+                {
+                    ThemeApplier.ApplyToTabItem(tabItem, themeColors);
+                }
+
+                // 更新菜单选中状态
+                UpdateThemeMenuSelection(savedTheme);
+
+                System.Diagnostics.Debug.WriteLine($"主题系统初始化完成，已加载主题: {themeColors.Name}");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"主题系统初始化失败: {ex.Message}");
+            }
+        }
+
+        #endregion
+
+        #region 标签页管理
+
+        private void CreateNewTab(string fileName = null, string content = "")
+        {
+            try
+            {
+                var tabItem = new FileTabItem
+                {
+                    FileName = fileName ?? $"无标题{_newFileCounter++}",
+                    Content = content,
+                    Encoding = "UTF-8"
+                };
+                tabItem.OriginalContent = content;
+
+                // 获取TabControl
+                var tabControl = FileTabControl;
+                if (tabControl == null)
+                {
+                    MessageBox.Show("无法找到标签页控件", "错误");
+                    return;
+                }
+
+                // 创建新的标签页UI
+                var newTabItem = new TabItem
+                {
+                    Header = tabItem.DisplayName,
+                    DataContext = tabItem
+                };
+
+                // 创建编辑器内容
+                var grid = new Grid();
+                grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto, MinWidth = 35 });
+                grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+                var lineNumbers = new TextBox
+                {
+                    Background = new SolidColorBrush(Color.FromRgb(0x16, 0x1B, 0x22)),
+                    Foreground = new SolidColorBrush(Color.FromRgb(0x7D, 0x85, 0x90)),
+                    BorderThickness = new Thickness(0, 0, 1, 0),
+                    BorderBrush = new SolidColorBrush(Color.FromRgb(0x30, 0x36, 0x3D)),
+                    FontFamily = new FontFamily("Consolas"),
+                    FontSize = 13,
+                    IsReadOnly = true,
+                    IsTabStop = false,
+                    VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
+                    HorizontalScrollBarVisibility = ScrollBarVisibility.Hidden,
+                    TextAlignment = TextAlignment.Right,
+                    Padding = new Thickness(8, 12, 8, 12),
+                    Width = 35,
+                    MinWidth = 35
+                };
+
+                var textEditor = new TextBox
+                {
+                    Background = new SolidColorBrush(Color.FromRgb(0x0D, 0x11, 0x17)),
+                    Foreground = new SolidColorBrush(Color.FromRgb(0xE6, 0xED, 0xF3)),
+                    BorderBrush = new SolidColorBrush(Color.FromRgb(0x30, 0x36, 0x3D)),
+                    BorderThickness = new Thickness(1),
+                    FontFamily = new FontFamily("Consolas"),
+                    FontSize = 14,
+                    Padding = new Thickness(12),
+                    AcceptsReturn = true,
+                    AcceptsTab = true,
+                    VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                    HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+                    TextWrapping = TextWrapping.NoWrap,
+                    Text = content
+                };
+
+                // 绑定事件
+                textEditor.TextChanged += (s, e) => {
+                    try {
+                        OnTabTextChanged(tabItem, textEditor);
+                    } catch (Exception ex) {
+                        System.Diagnostics.Debug.WriteLine($"文本变化事件错误: {ex.Message}");
+                    }
+                };
+                textEditor.SelectionChanged += (s, e) => {
+                    try {
+                        UpdateCursorPosition();
+                        UpdateSelectionInfo();
+                    } catch (Exception ex) {
+                        System.Diagnostics.Debug.WriteLine($"选择变化事件错误: {ex.Message}");
+                    }
+                };
+                textEditor.PreviewKeyDown += TextEditor_PreviewKeyDown;
+                
+                // 添加滚动同步事件 - 使用附加属性
+                textEditor.AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler((s, e) => {
+                    try {
+                        // 同步行号滚动
+                        if (lineNumbers != null)
+                        {
+                            lineNumbers.ScrollToVerticalOffset(e.VerticalOffset);
+                        }
+                    } catch (Exception ex) {
+                        System.Diagnostics.Debug.WriteLine($"滚动同步错误: {ex.Message}");
+                    }
+                }));
+
+                // 设置控件引用
+                tabItem.TextEditor = textEditor;
+                tabItem.LineNumbersEditor = lineNumbers;
+
+                Grid.SetColumn(lineNumbers, 0);
+                Grid.SetColumn(textEditor, 1);
+                grid.Children.Add(lineNumbers);
+                grid.Children.Add(textEditor);
+
+                newTabItem.Content = grid;
+                _tabItems.Add(tabItem);
+
+                // 添加到TabControl
+                tabControl.Items.Add(newTabItem);
+                tabControl.SelectedItem = newTabItem;
+
+                _currentTab = tabItem;
+                UpdateLineNumbers(lineNumbers, textEditor);
+                UpdateTitle();
+                UpdateTabList();
+                
+                // 应用当前主题到新标签页
+                if (_isFullyInitialized)
+                {
+                    var currentTheme = ThemeManager.GetCurrentThemeColors();
+                    ThemeApplier.ApplyToTabItem(tabItem, currentTheme);
+                }
+                
+                UpdateStatus($"已创建新标签页: {tabItem.FileName}");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"创建标签页失败: {ex.Message}", "错误");
+                System.Diagnostics.Debug.WriteLine($"创建标签页错误: {ex}");
+            }
+        }
+
+        private void CloseTab(FileTabItem tab)
+        {
+            try
+            {
+                if (tab == null) return;
+
+                // 检查是否需要保存
+                if (tab.IsModified)
+                {
+                    var result = MessageBox.Show(
+                        $"文件 '{tab.FileName}' 已被修改。\n是否要保存更改？",
+                        "保存",
+                        MessageBoxButton.YesNoCancel,
+                        MessageBoxImage.Question);
+
+                    switch (result)
+                    {
+                        case MessageBoxResult.Yes:
+                            if (!SaveTab(tab)) return; // 保存失败则不关闭
+                            break;
+                        case MessageBoxResult.Cancel:
+                            return; // 取消关闭
+                        case MessageBoxResult.No:
+                            break; // 不保存直接关闭
+                    }
+                }
+
+                // 移除标签页
+                var tabControl = FileTabControl;
+                if (tabControl != null)
+                {
+                    var tabItem = tabControl.Items.Cast<TabItem>().FirstOrDefault(t => t.DataContext == tab);
+                    if (tabItem != null)
+                    {
+                        tabControl.Items.Remove(tabItem);
+                    }
+                }
+
+                _tabItems.Remove(tab);
+
+                // 如果关闭的是当前标签页，切换到其他标签页
+                if (_currentTab == tab)
+                {
+                    if (_tabItems.Count > 0)
+                    {
+                        SwitchToTab(_tabItems.Last());
+                    }
+                    else
+                    {
+                        CreateMinimalWelcomeTab(); // 没有标签页时创建欢迎页
+                    }
+                }
+
+                UpdateTabList();
+                UpdateStatus($"已关闭标签页: {tab.FileName}");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"关闭标签页失败: {ex.Message}", "错误");
+                System.Diagnostics.Debug.WriteLine($"关闭标签页错误: {ex}");
+            }
+        }
+
+        private void SwitchToTab(FileTabItem tab)
+        {
+            try
+            {
+                if (tab == null) return;
+
+                var tabControl = FileTabControl;
+                if (tabControl == null) return;
+
+                var tabItem = tabControl.Items.Cast<TabItem>().FirstOrDefault(t => t.DataContext == tab);
+                if (tabItem != null)
+                {
+                    tabControl.SelectedItem = tabItem;
+                    _currentTab = tab;
+                    UpdateTitle();
+                    UpdateCursorPosition();
+                    UpdateSelectionInfo();
+                    
+                    if (EncodingText != null)
+                    {
+                        EncodingText.Text = tab.Encoding ?? "UTF-8";
+                    }
+                    
+                    UpdateStatus($"已切换到标签页: {tab.FileName}");
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"切换标签页错误: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 标签页关闭按钮点击事件
+        /// </summary>
+        private void CloseTabButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is Button closeButton && closeButton.Tag is FileTabItem tabItem)
+            {
+                CloseTab(tabItem);
+            }
+        }
+
+        #endregion
+
+        #region 主题管理
+
+        private void SetDarkTheme_Click(object sender, RoutedEventArgs e)
+        {
+            PreviewAndSetTheme(ThemeType.Dark);
+        }
+
+        private void SetLightTheme_Click(object sender, RoutedEventArgs e)
+        {
+            PreviewAndSetTheme(ThemeType.Light);
+        }
+
+        private void SetHighContrastTheme_Click(object sender, RoutedEventArgs e)
+        {
+            PreviewAndSetTheme(ThemeType.HighContrast);
+        }
+
+        private void SetEyeCareTheme_Click(object sender, RoutedEventArgs e)
+        {
+            PreviewAndSetTheme(ThemeType.EyeCare);
+        }
+
+        private void SetMonokaiTheme_Click(object sender, RoutedEventArgs e)
+        {
+            PreviewAndSetTheme(ThemeType.Monokai);
+        }
+
+        private void SetSolarizedTheme_Click(object sender, RoutedEventArgs e)
+        {
+            PreviewAndSetTheme(ThemeType.Solarized);
+        }
+
+        /// <summary>
+        /// 预览并设置主题
+        /// </summary>
+        private void PreviewAndSetTheme(ThemeType themeType)
+        {
+            try
+            {
+                // 如果正在预览其他主题，先恢复当前主题
+                if (_isPreviewingTheme && _previewTheme != ThemeManager.CurrentTheme)
+                {
+                    // 恢复当前主题
+                    ApplyThemeToUI(ThemeManager.CurrentTheme);
+                }
+                
+                // 应用预览主题
+                ApplyThemeToUI(themeType);
+                
+                // 设置预览状态
+                _previewTheme = themeType;
+                _isPreviewingTheme = true;
+                
+                // 3秒后自动确认或恢复
+                var timer = new DispatcherTimer
+                {
+                    Interval = TimeSpan.FromSeconds(3)
+                };
+                timer.Tick += (s, e) =>
+                {
+                    timer.Stop();
+                    if (_isPreviewingTheme)
+                    {
+                        ConfirmTheme(themeType);
+                    }
+                };
+                timer.Start();
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"主题预览失败: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"主题预览错误: {ex}");
+            }
+        }
+        
+        /// <summary>
+        /// 应用主题到UI（预览或正式应用）
+        /// </summary>
+        private void ApplyThemeToUI(ThemeType themeType)
+        {
+            var themeColors = ThemeManager.GetThemeColors(themeType);
+            
+            // 应用主题到主窗口
+            ThemeApplier.ApplyThemeToMainWindow(this, themeColors);
+            
+            // 应用主题到所有标签页
+            foreach (var tabItem in _tabItems)
+            {
+                ThemeApplier.ApplyToTabItem(tabItem, themeColors);
+            }
+            
+            // 更新菜单选中状态（预览时不更新）
+            if (!_isPreviewingTheme || themeType == ThemeManager.CurrentTheme)
+            {
+                UpdateThemeMenuSelection(themeType);
+            }
+        }
+        
+        /// <summary>
+        /// 确认主题选择
+        /// </summary>
+        private void ConfirmTheme(ThemeType themeType)
+        {
+            try
+            {
+                // 设置主题
+                ThemeManager.SetTheme(themeType);
+                var themeColors = ThemeManager.GetCurrentThemeColors();
+                
+                // 应用主题到主窗口
+                ThemeApplier.ApplyThemeToMainWindow(this, themeColors);
+                
+                // 应用主题到所有标签页
+                foreach (var tabItem in _tabItems)
+                {
+                    ThemeApplier.ApplyToTabItem(tabItem, themeColors);
+                }
+                
+                // 更新菜单选中状态
+                UpdateThemeMenuSelection(themeType);
+                
+                // 保存主题设置
+                ConfigManager.SaveTheme(themeType);
+                
+                // 重置预览状态
+                _isPreviewingTheme = false;
+                
+                // 更新状态
+                UpdateStatus($"主题已切换为: {themeColors.Name}，已保存设置");
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"主题切换失败: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"主题切换错误: {ex}");
+            }
+        }
+
+        private void SetTheme(ThemeType themeType)
+        {
+            try
+            {
+                // 设置主题
+                ThemeManager.SetTheme(themeType);
+                var themeColors = ThemeManager.GetCurrentThemeColors();
+
+                // 应用主题到主窗口
+                ThemeApplier.ApplyThemeToMainWindow(this, themeColors);
+
+                // 应用主题到所有标签页
+                foreach (var tabItem in _tabItems)
+                {
+                    ThemeApplier.ApplyToTabItem(tabItem, themeColors);
+                }
+
+                // 更新菜单选中状态
+                UpdateThemeMenuSelection(themeType);
+
+                // 保存主题设置
+                ConfigManager.SaveTheme(themeType);
+
+                // 更新状态
+                UpdateStatus($"主题已切换为: {themeColors.Name}，已保存设置");
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"主题切换失败: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"主题切换错误: {ex}");
+            }
+        }
+
+        private void UpdateThemeMenuSelection(ThemeType selectedTheme)
+        {
+            // 取消所有主题菜单项的选中状态
+            DarkThemeMenuItem.IsChecked = false;
+            LightThemeMenuItem.IsChecked = false;
+            HighContrastThemeMenuItem.IsChecked = false;
+            EyeCareThemeMenuItem.IsChecked = false;
+            MonokaiThemeMenuItem.IsChecked = false;
+            SolarizedThemeMenuItem.IsChecked = false;
+
+            // 设置当前主题菜单项为选中状态
+            switch (selectedTheme)
+            {
+                case ThemeType.Dark:
+                    DarkThemeMenuItem.IsChecked = true;
+                    break;
+                case ThemeType.Light:
+                    LightThemeMenuItem.IsChecked = true;
+                    break;
+                case ThemeType.HighContrast:
+                    HighContrastThemeMenuItem.IsChecked = true;
+                    break;
+                case ThemeType.EyeCare:
+                    EyeCareThemeMenuItem.IsChecked = true;
+                    break;
+                case ThemeType.Monokai:
+                    MonokaiThemeMenuItem.IsChecked = true;
+                    break;
+                case ThemeType.Solarized:
+                    SolarizedThemeMenuItem.IsChecked = true;
+                    break;
+            }
+            
+            // 同时更新工具栏上的ComboBox选择
+            UpdateThemeComboBox(selectedTheme);
+        }
+        
+        private void UpdateThemeComboBox(ThemeType selectedTheme)
+        {
+            if (ThemeSelector == null) return;
+            
+            // 临时移除事件处理器，避免循环触发
+            ThemeSelector.SelectionChanged -= ThemeSelector_SelectionChanged;
+            
+            var themeTag = selectedTheme.ToString();
+            foreach (ComboBoxItem item in ThemeSelector.Items)
+            {
+                if (item.Tag?.ToString() == themeTag)
+                {
+                    ThemeSelector.SelectedItem = item;
+                    break;
+                }
+            }
+            
+            // 重新添加事件处理器
+            ThemeSelector.SelectionChanged += ThemeSelector_SelectionChanged;
+        }
+        
+        private void ThemeSelector_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            // 防止在初始化过程中触发
+            if (!_isFullyInitialized || sender is not ComboBox comboBox || comboBox.SelectedItem is not ComboBoxItem selectedItem)
+                return;
+                
+            var themeTag = selectedItem.Tag?.ToString();
+            if (Enum.TryParse<ThemeType>(themeTag, out var themeType))
+            {
+                SetTheme(themeType);
+            }
+        }
+
+        #endregion
+        
+        #region 文件操作
+
+        private void NewFile()
+        {
+            CreateNewTab();
+        }
+
+        private void OpenFile()
+        {
+            // 检查是否已完成初始化
+            if (!_isFullyInitialized || _encodingDetector == null)
+            {
+                MessageBox.Show("功能正在加载中，请稍后重试", "提示",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            try
+            {
+                var dialog = new OpenFileDialog
+                {
+                    Title = "打开文件",
+                    Filter = "所有文件 (*.*)|*.*|文本文件 (*.txt)|*.txt|C# 文件 (*.cs)|*.cs|JavaScript 文件 (*.js)|*.js|Python 文件 (*.py)|*.py"
+                };
+
+                if (dialog.ShowDialog() == true)
+                {
+                    // 检查是否已经打开了这个文件
+                    var existingTab = _tabItems.FirstOrDefault(t => 
+                        !string.IsNullOrEmpty(t.FilePath) && 
+                        string.Equals(t.FilePath, dialog.FileName, StringComparison.OrdinalIgnoreCase));
+                    
+                    if (existingTab != null)
+                    {
+                        SwitchToTab(existingTab);
+                        UpdateStatus($"文件已在标签页中打开: {Path.GetFileName(dialog.FileName)}");
+                        return;
+                    }
+
+                    LoadFileInNewTab(dialog.FileName);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"打开文件失败: {ex.Message}", "错误",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+                System.Diagnostics.Debug.WriteLine($"打开文件错误: {ex}");
+            }
+        }
+
+        private void LoadFileInNewTab(string filePath)
+        {
+            try
+            {
+                if (!File.Exists(filePath))
+                {
+                    MessageBox.Show($"文件不存在: {filePath}", "错误");
+                    return;
+                }
+
+                // 检测编码
+                var encodingResult = _encodingDetector.DetectFileEncoding(filePath);
+                
+                // 读取文件
+                var content = File.ReadAllText(filePath, encodingResult.Encoding);
+                var fileName = Path.GetFileName(filePath);
+
+                // 创建新标签页
+                CreateNewTab(fileName, content);
+                
+                // 设置文件信息
+                if (_currentTab != null)
+                {
+                    _currentTab.FilePath = filePath;
+                    _currentTab.Encoding = encodingResult.EncodingName;
+                    _currentTab.OriginalContent = content;
+
+                    UpdateStatus($"文件已打开: {fileName} - 编码: {encodingResult.EncodingName} (置信度: {encodingResult.Confidence:P0})");
+                    EncodingText.Text = encodingResult.EncodingName;
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"加载文件失败: {ex.Message}", "错误");
+                System.Diagnostics.Debug.WriteLine($"加载文件错误: {ex}");
+            }
+        }
+
+        private void SaveFile()
+        {
+            if (_currentTab == null) return;
+            SaveTab(_currentTab);
+        }
+
+        private bool SaveTab(FileTabItem tab)
+        {
+            if (tab == null) return false;
+
+            if (string.IsNullOrEmpty(tab.FilePath))
+            {
+                return SaveTabAs(tab);
+            }
+
+            try
+            {
+                // 保存前创建备份
+                if (!string.IsNullOrEmpty(tab.FilePath) && File.Exists(tab.FilePath))
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        var originalContent = await File.ReadAllTextAsync(tab.FilePath);
+                        await BackupManager.CreateBackupAsync(tab.FilePath, originalContent, true);
+                    });
+                }
+                
+                var encoding = GetEncodingFromName(tab.Encoding);
+                File.WriteAllText(tab.FilePath, tab.Content, encoding);
+                tab.MarkAsSaved();
+
+                var fileName = Path.GetFileName(tab.FilePath);
+                UpdateStatus($"文件已保存: {fileName}");
+                UpdateTabHeader(tab);
+                
+                // 保存后创建版本备份
+                _ = BackupManager.CreateBackupAsync(tab.FilePath, tab.Content, false);
+                
+                return true;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"保存失败：{ex.Message}", "错误",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+                return false;
+            }
+        }
+
+        private void SaveAsFile()
+        {
+            if (_currentTab == null) return;
+            SaveTabAs(_currentTab);
+        }
+
+        private bool SaveTabAs(FileTabItem tab)
+        {
+            if (tab == null) return false;
+
+            var dialog = new SaveFileDialog
+            {
+                Title = "另存为",
+                Filter = "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*",
+                DefaultExt = "txt",
+                FileName = tab.FileName
+            };
+
+            if (dialog.ShowDialog() == true)
+            {
+                try
+                {
+                    var encoding = GetEncodingFromName(tab.Encoding);
+                    File.WriteAllText(dialog.FileName, tab.Content, encoding);
+                    
+                    tab.FilePath = dialog.FileName;
+                    tab.FileName = Path.GetFileName(dialog.FileName);
+                    tab.MarkAsSaved();
+
+                    UpdateStatus($"文件已保存: {tab.FileName}");
+                    UpdateTabHeader(tab);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"保存失败：{ex.Message}", "错误",
+                        MessageBoxButton.OK, MessageBoxImage.Error);
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        private void SaveAllFiles()
+        {
+            var modifiedTabs = _tabItems.Where(t => t.IsModified).ToList();
+            foreach (var tab in modifiedTabs)
+            {
+                if (!SaveTab(tab))
+                {
+                    // 如果有文件保存失败，询问是否继续
+                    var result = MessageBox.Show(
+                        $"文件 '{tab.FileName}' 保存失败。\n是否继续保存其他文件？",
+                        "保存错误",
+                        MessageBoxButton.YesNo,
+                        MessageBoxImage.Warning);
+                    
+                    if (result == MessageBoxResult.No) break;
+                }
+            }
+        }
+
+        #endregion
+
+        #region 编码操作
+
+        private void DetectEncoding()
+        {
+            // 检查是否已完成初始化
+            if (!_isFullyInitialized || _encodingDetector == null)
+            {
+                MessageBox.Show("功能正在加载中，请稍后重试", "提示",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            
+            if (_currentTab == null)
+            {
+                MessageBox.Show("请先打开或创建一个文件", "提示",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            try
+            {
+                string result;
+                
+                if (!string.IsNullOrEmpty(_currentTab.FilePath) && File.Exists(_currentTab.FilePath))
+                {
+                    // 如果有文件路径，检测文件编码
+                    var fileResult = _encodingDetector.DetectFileEncoding(_currentTab.FilePath);
+                    result = $"文件编码检测结果：\n\n" +
+                             $"文件路径: {_currentTab.FilePath}\n" +
+                             $"检测到的编码: {fileResult.EncodingName}\n" +
+                             $"置信度: {fileResult.Confidence:P0}\n" +
+                             $"当前使用编码: {_currentTab.Encoding}";
+                }
+                else
+                {
+                    // 如果没有文件路径，检测当前文本内容的编码
+                    var content = _currentTab.Content ?? "";
+                    var bytes = Encoding.UTF8.GetBytes(content);
+                    var textResult = _encodingDetector.DetectEncoding(bytes);
+                    
+                    var charCount = content.Length;
+                    var byteCount = bytes.Length;
+                    
+                    result = $"文本内容编码检测结果：\n\n" +
+                             $"文本长度: {charCount} 个字符\n" +
+                             $"字节大小: {byteCount} 字节\n" +
+                             $"检测到的编码: {textResult.EncodingName}\n" +
+                             $"置信度: {textResult.Confidence:P0}\n" +
+                             $"当前使用编码: {_currentTab.Encoding}";
+                }
+
+                MessageBox.Show(result, "编码检测结果",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"检测失败：{ex.Message}", "错误",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void ConvertEncoding()
+        {
+            if (_currentTab == null) return;
+
+            var dialog = new EncodingSelectionDialog(_currentTab.Encoding);
+            if (dialog.ShowDialog() == true)
+            {
+                _currentTab.Encoding = dialog.SelectedEncoding;
+                _currentTab.Content = _currentTab.TextEditor.Text; // 触发修改状态更新
+                EncodingText.Text = _currentTab.Encoding;
+                UpdateStatus($"编码已设置为: {_currentTab.Encoding}");
+            }
+        }
+
+        private Encoding GetEncodingFromName(string encodingName)
+        {
+            return encodingName.ToUpper() switch
+            {
+                "UTF-8" => Encoding.UTF8,
+                "GBK" => Encoding.GetEncoding("GBK"),
+                "UTF-16" => Encoding.Unicode,
+                "ASCII" => Encoding.ASCII,
+                "ISO-8859-1" => Encoding.GetEncoding("ISO-8859-1"),
+                _ => Encoding.UTF8
+            };
+        }
+
+        #endregion
+
+        #region UI更新
+
+        private void UpdateTitle()
+        {
+            var title = "Smart Text Editor";
+            if (_currentTab != null)
+            {
+                title = $"{_currentTab.DisplayName} - {title}";
+            }
+            Title = title;
+        }
+
+        private void UpdateTabHeader(FileTabItem tab)
+        {
+            var tabControl = FindName("FileTabControl") as TabControl;
+            var tabItem = tabControl.Items.Cast<TabItem>().FirstOrDefault(t => t.DataContext == tab);
+            if (tabItem != null)
+            {
+                tabItem.Header = tab.DisplayName;
+            }
+        }
+
+        private void UpdateStatus(string message)
+        {
+            if (StatusText != null)
+            {
+                StatusText.Text = message;
+            }
+            if (StatusIndicator != null)
+            {
+                StatusIndicator.Fill = _currentTab?.IsModified == true ? Brushes.Orange : Brushes.LimeGreen;
+            }
+        }
+
+        private void UpdateLineNumbers(TextBox lineNumbersBox, TextBox textEditor)
+        {
+            if (lineNumbersBox == null || textEditor == null) return;
+
+            try
+            {
+                var lineCount = textEditor.LineCount;
+                var charCount = textEditor.Text.Length;
+                
+                // 对于超大文件，使用虚拟化显示
+                if (charCount > HUGE_FILE_THRESHOLD)
+                {
+                    UpdateLineNumbersForHugeFile(lineNumbersBox, lineCount);
+                    return;
+                }
+                
+                // 对于大文件，使用异步更新以避免UI冻结
+                if (charCount > LARGE_FILE_THRESHOLD || lineCount > 10000)
+                {
+                    UpdateLineNumbersAsync(lineNumbersBox, lineCount);
+                    return;
+                }
+                
+                // 小文件直接同步更新
+                UpdateLineNumbersSync(lineNumbersBox, lineCount);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"更新行号失败: {ex.Message}");
+            }
+        }
+        
+        private void UpdateLineNumbersSync(TextBox lineNumbersBox, int lineCount)
+        {
+            var lineNumbers = new StringBuilder(lineCount * 8); // 预分配容量
+            
+            // 计算最大行号的宽度，用于对齐
+            var maxLineNumber = lineCount.ToString();
+            var maxWidth = maxLineNumber.Length;
+            
+            for (int i = 1; i <= lineCount; i++)
+            {
+                // 右对齐行号
+                var lineNumber = i.ToString().PadLeft(maxWidth, ' ');
+                
+                if (i < lineCount)
+                {
+                    lineNumbers.AppendLine(lineNumber);
+                }
+                else
+                {
+                    // 最后一行不添加换行符，避免多一个空行
+                    lineNumbers.Append(lineNumber);
+                }
+            }
+            
+            lineNumbersBox.Text = lineNumbers.ToString();
+            
+            // 调整行号区域宽度
+            var expectedWidth = Math.Max(35, maxWidth * 8 + 16);
+            if (Math.Abs(lineNumbersBox.Width - expectedWidth) > 5)
+            {
+                lineNumbersBox.Width = expectedWidth;
+            }
+        }
+        
+        private async void UpdateLineNumbersAsync(TextBox lineNumbersBox, int lineCount)
+        {
+            try
+            {
+                // 显示加载提示
+                var originalText = lineNumbersBox.Text;
+                lineNumbersBox.Text = "加载中...";
+                
+                // 在后台线程生成行号
+                var lineNumbers = await Task.Run(() => GenerateLineNumbers(lineCount));
+                
+                // 回到UI线程更新
+                lineNumbersBox.Text = lineNumbers.Text;
+                
+                if (Math.Abs(lineNumbersBox.Width - lineNumbers.Width) > 5)
+                {
+                    lineNumbersBox.Width = lineNumbers.Width;
+                }
+                
+                System.Diagnostics.Debug.WriteLine($"已完成大文件行号更新: {lineCount}行");
+                UpdateStatus($"已加载大文件：{lineCount:N0}行");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"异步更新行号失败: {ex.Message}");
+                // 失败时显示基本行号
+                lineNumbersBox.Text = "1"; 
+                UpdateStatus("行号加载失败");
+            }
+        }
+        
+        private void UpdateLineNumbersForHugeFile(TextBox lineNumbersBox, int lineCount)
+        {
+            try
+            {
+                // 对于超大文件，使用虚拟化显示
+                lineNumbersBox.Text = "超大文件\n使用\n虚拟化\n行号";
+                lineNumbersBox.Width = 60;
+                UpdateStatus($"超大文件已加载：{lineCount:N0}行（使用虚拟化行号）");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"超大文件行号更新失败: {ex.Message}");
+                lineNumbersBox.Text = "1";
+                UpdateStatus("行号加载失败");
+            }
+        }
+        
+        /// <summary>
+        /// 在后台线程生成行号文本
+        /// </summary>
+        private (string Text, int Width) GenerateLineNumbers(int lineCount)
+        {
+            var sb = new StringBuilder(lineCount * 8); // 预分配容量
+            var maxWidth = lineCount.ToString().Length;
+            
+            for (int i = 1; i <= lineCount; i++)
+            {
+                var lineNumber = i.ToString().PadLeft(maxWidth, ' ');
+                
+                if (i < lineCount)
+                {
+                    sb.AppendLine(lineNumber);
+                }
+                else
+                {
+                    sb.Append(lineNumber);
+                }
+                
+                // 每1000行检查一次取消（在实际应用中可以连接到取消令牌）
+                if (i % 1000 == 0)
+                {
+                    // 模拟让出CPU时间，避免阻塞
+                    System.Threading.Thread.Yield();
+                }
+            }
+            
+            return (sb.ToString(), Math.Max(35, maxWidth * 8 + 16));
+        }
+
+        private void UpdateCursorPosition()
+        {
+            if (_currentTab?.TextEditor == null || CursorPositionText == null) return;
+
+            var textEditor = _currentTab.TextEditor;
+            var line = textEditor.GetLineIndexFromCharacterIndex(textEditor.CaretIndex) + 1;
+            var column = textEditor.CaretIndex - textEditor.GetCharacterIndexFromLineIndex(line - 1) + 1;
+            CursorPositionText.Text = $"行 {line}, 列 {column}";
+        }
+        
+        private void UpdateSelectionInfo()
+        {
+            if (_currentTab?.TextEditor == null || SelectionInfoText == null)
+            {
+                if (SelectionInfoText != null)
+                    SelectionInfoText.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            var textEditor = _currentTab.TextEditor;
+            if (textEditor.SelectionLength > 0)
+            {
+                var selectedText = textEditor.SelectedText;
+                var charCount = selectedText.Length;
+                var byteCount = Encoding.UTF8.GetByteCount(selectedText);
+                SelectionInfoText.Text = $"选中: {charCount}个字符 ({byteCount}字节)";
+                SelectionInfoText.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                SelectionInfoText.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        private void UpdateTabList()
+        {
+            try
+            {
+                if (TabListMenuItem == null) return;
+                
+                TabListMenuItem.Items.Clear();
+                
+                for (int i = 0; i < _tabItems.Count; i++)
+                {
+                    var tab = _tabItems[i];
+                    var menuItem = new MenuItem
+                    {
+                        Header = $"{i + 1}. {tab.DisplayName}",
+                        IsChecked = tab == _currentTab,
+                        Tag = tab
+                    };
+                    
+                    menuItem.Click += (s, e) =>
+                    {
+                        try
+                        {
+                            var targetTab = (FileTabItem)((MenuItem)s).Tag;
+                            SwitchToTab(targetTab);
+                        }
+                        catch (Exception ex)
+                        {
+                            System.Diagnostics.Debug.WriteLine($"标签页列表点击错误: {ex.Message}");
+                        }
+                    };
+                    
+                    TabListMenuItem.Items.Add(menuItem);
+                }
+                
+                if (_tabItems.Count == 0)
+                {
+                    var emptyItem = new MenuItem { Header = "无活动标签页", IsEnabled = false };
+                    TabListMenuItem.Items.Add(emptyItem);
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"更新标签页列表错误: {ex.Message}");
+            }
+        }
+
+        #endregion
+
+        #region 事件处理
+
+        private void OnCurrentTabTextChanged()
+        {
+            if (_currentTab != null)
+            {
+                _currentTab.Content = WelcomeTextEditor.Text;
+                
+                // 对于大文件，使用防抖动更新行号
+                if (WelcomeTextEditor.LineCount > 10000)
+                {
+                    DebounceUpdateWelcomeLineNumbers();
+                }
+                else
+                {
+                    UpdateLineNumbers(WelcomeLineNumbers, WelcomeTextEditor);
+                }
+                
+                UpdateTabHeader(_currentTab);
+                UpdateTitle();
+                UpdateStatus("已修改");
+            }
+        }
+        
+        private DispatcherTimer _welcomeLineNumberUpdateTimer;
+        
+        private void DebounceUpdateWelcomeLineNumbers()
+        {
+            // 取消之前的定时器
+            _welcomeLineNumberUpdateTimer?.Stop();
+            
+            // 创建新的定时器，500ms后更新
+            _welcomeLineNumberUpdateTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(500)
+            };
+            
+            _welcomeLineNumberUpdateTimer.Tick += (s, e) =>
+            {
+                _welcomeLineNumberUpdateTimer.Stop();
+                UpdateLineNumbers(WelcomeLineNumbers, WelcomeTextEditor);
+            };
+            
+            _welcomeLineNumberUpdateTimer.Start();
+        }
+
+        private void OnTabTextChanged(FileTabItem tab, TextBox textEditor)
+        {
+            if (tab != null)
+            {
+                tab.Content = textEditor.Text;
+                
+                // 对于大文件，使用防抖动更新行号
+                var charCount = textEditor.Text.Length;
+                if (charCount > LARGE_FILE_THRESHOLD || textEditor.LineCount > 10000)
+                {
+                    DebounceUpdateLineNumbers(tab, textEditor);
+                }
+                else
+                {
+                    UpdateLineNumbers(tab.LineNumbersEditor, textEditor);
+                }
+                
+                UpdateTabHeader(tab);
+                if (tab == _currentTab)
+                {
+                    UpdateTitle();
+                    UpdateStatus("已修改");
+                }
+            }
+        }
+        
+        private DispatcherTimer _lineNumberUpdateTimer;
+        private FileTabItem _pendingUpdateTab;
+        private TextBox _pendingUpdateTextEditor;
+        
+        private void DebounceUpdateLineNumbers(FileTabItem tab, TextBox textEditor)
+        {
+            // 取消之前的定时器
+            _lineNumberUpdateTimer?.Stop();
+            
+            _pendingUpdateTab = tab;
+            _pendingUpdateTextEditor = textEditor;
+            
+            // 创建新的定时器，根据文件大小调整延迟时间
+            var delayMs = textEditor.Text.Length > HUGE_FILE_THRESHOLD ? 1000 : 500;
+            
+            _lineNumberUpdateTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(delayMs)
+            };
+            
+            _lineNumberUpdateTimer.Tick += (s, e) =>
+            {
+                _lineNumberUpdateTimer.Stop();
+                if (_pendingUpdateTab != null && _pendingUpdateTextEditor != null)
+                {
+                    UpdateLineNumbers(_pendingUpdateTab.LineNumbersEditor, _pendingUpdateTextEditor);
+                }
+                _pendingUpdateTab = null;
+                _pendingUpdateTextEditor = null;
+            };
+            
+            _lineNumberUpdateTimer.Start();
+        }
+
+        private void TextEditor_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Tab)
+            {
+                var textBox = sender as TextBox;
+                var selectionStart = textBox.SelectionStart;
+                textBox.Text = textBox.Text.Insert(selectionStart, "    ");
+                textBox.SelectionStart = selectionStart + 4;
+                e.Handled = true;
+        private void WelcomeTextEditor_ScrollChanged(object sender, ScrollChangedEventArgs e)
+        {
+            try
+            {
+                // 同步行号滚动
+                if (WelcomeLineNumbers != null)
+                {
+                    WelcomeLineNumbers.ScrollToVerticalOffset(e.VerticalOffset);
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"欢迎页滚动同步错误: {ex.Message}");
+            }
+        }
+
+        #endregion
+
+        #region 自动缓存功能
+        
+        private void InitializeAutoCache()
+        {
+            if (!Directory.Exists(_cacheDirectory))
+            {
+                Directory.CreateDirectory(_cacheDirectory);
+            }
+            
+            _autoCacheTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromSeconds(60) // 增加到60秒，减少频繁写入
+            };
+            _autoCacheTimer.Tick += AutoCache_Tick;
+            _autoCacheTimer.Start();
+            
+            // 启动时异步清理过期缓存
+            _ = Task.Run(CleanupOldCaches);
+        }
+        
+        private async void AutoCache_Tick(object sender, EventArgs e)
+        {
+            try
+            {
+                var modifiedTabs = _tabItems.Where(t => t.IsModified && !string.IsNullOrEmpty(t.Content)).ToList();
+                
+                if (modifiedTabs.Any())
+                {
+                    // 异步保存缓存，避免阻塞UI
+                    await Task.Run(() =>
+                    {
+                        foreach (var tab in modifiedTabs)
+                        {
+                            SaveAutoCache(tab);
+                        }
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"自动缓存错误: {ex.Message}");
+            }
+        }
+        
+        private void SaveAutoCache(FileTabItem tab)
+        {
+            // 使用锁确保线程安全
+            lock (_cacheLock)
+            {
+                try
+                {
+                    var cacheFile = Path.Combine(_cacheDirectory, $"tab_cache_{tab.Id}.cache");
+                    var metaFile = Path.Combine(_cacheDirectory, $"tab_cache_{tab.Id}.meta");
+                    var gzipFile = Path.Combine(_cacheDirectory, $"tab_cache_{tab.Id}.cache.gz");
+                    
+                    // 检查内容是否有变化，避免不必要的写入
+                    if (File.Exists(cacheFile))
+                    {
+                        var existingContent = File.ReadAllText(cacheFile, Encoding.UTF8);
+                        if (existingContent == tab.Content)
+                            return; // 内容未变化，跳过保存
+                    }
+                    
+                    // 检查gzip文件
+                    if (File.Exists(gzipFile))
+                    {
+                        try
+                        {
+                            using (var fileStream = File.OpenRead(gzipFile))
+                            using (var gzipStream = new GZipStream(fileStream, CompressionMode.Decompress))
+                            using (var reader = new StreamReader(gzipStream, Encoding.UTF8))
+                            {
+                                var existingContent = reader.ReadToEnd();
+                                if (existingContent == tab.Content)
+                                    return; // 内容未变化，跳过保存
+                            }
+                        }
+                        catch
+                        {
+                            // 解压失败，继续保存
+                        }
+                    }
+                    
+                    // 根据内容大小决定是否使用压缩
+                    bool useCompression = tab.Content.Length > CACHE_COMPRESS_THRESHOLD;
+                    
+                    if (useCompression)
+                    {
+                        SaveCompressedCache(gzipFile, tab.Content);
+                        // 删除未压缩的缓存文件（如果存在）
+                        if (File.Exists(cacheFile))
+                        {
+                            File.Delete(cacheFile);
+                        }
+                    }
+                    else
+                    {
+                        File.WriteAllText(cacheFile, tab.Content, Encoding.UTF8);
+                        // 删除压缩的缓存文件（如果存在）
+                        if (File.Exists(gzipFile))
+                        {
+                            File.Delete(gzipFile);
+                        }
+                    }
+                    
+                    var metadata = new StringBuilder();
+                    metadata.AppendLine($"FilePath={tab.FilePath ?? ""}");
+                    metadata.AppendLine($"FileName={tab.FileName}");
+                    metadata.AppendLine($"Encoding={tab.Encoding}");
+                    metadata.AppendLine($"SaveTime={DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                    metadata.AppendLine($"ContentLength={tab.Content.Length}");
+                    metadata.AppendLine($"IsCompressed={useCompression}");
+                    
+                    File.WriteAllText(metaFile, metadata.ToString(), Encoding.UTF8);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"自动缓存失败: {ex.Message}");
+                }
+            }
+        }
+        
+        private void SaveCompressedCache(string gzipFile, string content)
+        {
+            try
+            {
+                var bytes = Encoding.UTF8.GetBytes(content);
+                using (var fileStream = File.Create(gzipFile))
+                using (var gzipStream = new GZipStream(fileStream, CompressionMode.Compress, true))
+                {
+                    gzipStream.Write(bytes, 0, bytes.Length);
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"压缩缓存保存失败: {ex.Message}");
+                // 降级到普通保存
+                var cacheFile = gzipFile.Replace(".gz", "");
+                File.WriteAllText(cacheFile, content, Encoding.UTF8);
+            }
+        }
+        
+        private string LoadCompressedCache(string gzipFile)
+        {
+            try
+            {
+                using (var fileStream = File.OpenRead(gzipFile))
+                using (var gzipStream = new GZipStream(fileStream, CompressionMode.Decompress))
+                using (var reader = new StreamReader(gzipStream, Encoding.UTF8))
+                {
+                    return reader.ReadToEnd();
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"压缩缓存加载失败: {ex.Message}");
+                return null;
+            }
+        }
+        
+        private async Task CleanupOldCaches()
+        {
+            try
+            {
+                if (!Directory.Exists(_cacheDirectory))
+                    return;
+                
+                var cacheFiles = Directory.GetFiles(_cacheDirectory, "*.cache")
+                    .Concat(Directory.GetFiles(_cacheDirectory, "*.cache.gz"))
+                    .ToList();
+                
+                var cutoffTime = DateTime.Now.AddDays(-CACHE_CLEANUP_INTERVAL); // 删除7天前的缓存
+                
+                foreach (var cacheFile in cacheFiles)
+                {
+                    var fileInfo = new FileInfo(cacheFile);
+                    if (fileInfo.LastWriteTime < cutoffTime)
+                    {
+                        try
+                        {
+                            File.Delete(cacheFile);
+                            
+                            // 删除对应的meta文件
+                            var metaFile = cacheFile.Replace(".cache", ".meta").Replace(".gz", "");
+                            if (File.Exists(metaFile))
+                            {
+                                File.Delete(metaFile);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            System.Diagnostics.Debug.WriteLine($"删除缓存文件失败: {ex.Message}");
+                        }
+                    }
+                }
+                
+                System.Diagnostics.Debug.WriteLine("缓存清理完成");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"缓存清理失败: {ex.Message}");
+            }
+        }
+
+        protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
+        {
+            try
+            {
+                _autoCacheTimer?.Stop();
+                
+                // 保存窗口设置
+                ConfigManager.SaveWindowSettings(this.ActualWidth, this.ActualHeight);
+                
+                // 保存会话信息（在检查保存前）
+                SaveCurrentSession();
+                
+                // 检查是否有未保存的文件
+                var modifiedTabs = _tabItems.Where(t => t.IsModified).ToList();
+                if (modifiedTabs.Count > 0)
+                {
+                    var result = MessageBox.Show(
+                        $"有 {modifiedTabs.Count} 个文件未保存。\n是否要保存这些文件？",
+                        "保存",
+                        MessageBoxButton.YesNoCancel,
+                        MessageBoxImage.Question);
+
+                    switch (result)
+                    {
+                        case MessageBoxResult.Yes:
+                            SaveAllFiles();
+                            // 保存后更新会话信息
+                            SaveCurrentSession();
+                            break;
+                        case MessageBoxResult.Cancel:
+                            e.Cancel = true;
+                            return;
+                    }
+                }
+                
+                // 异步保存所有修改的标签页缓存
+                _ = Task.Run(() =>
+                {
+                    foreach (var tab in modifiedTabs)
+                    {
+                        SaveAutoCache(tab);
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"窗口关闭处理错误: {ex.Message}");
+            }
+            
+            base.OnClosing(e);
+        }
+
+        private void SaveCurrentSession()
+        {
+            try
+            {
+                var sessionTabs = new List<ConfigManager.SessionTab>();
+                var activeTabIndex = 0;
+
+                for (int i = 0; i < _tabItems.Count; i++)
+                {
+                    var tab = _tabItems[i];
+                    
+                    // 跳过欢迎页
+                    if (tab.FileName == "欢迎" && string.IsNullOrEmpty(tab.FilePath))
+                        continue;
+
+                    var sessionTab = new ConfigManager.SessionTab
+                    {
+                        FileName = tab.FileName,
+                        FilePath = tab.FilePath ?? "",
+                        Content = tab.Content ?? "",
+                        Encoding = tab.Encoding ?? "UTF-8",
+                        IsModified = tab.IsModified,
+                        CursorPosition = tab.TextEditor?.CaretIndex ?? 0,
+                        SelectionStart = tab.TextEditor?.SelectionStart ?? 0,
+                        SelectionLength = tab.TextEditor?.SelectionLength ?? 0
+                    };
+                    
+                    sessionTabs.Add(sessionTab);
+                    
+                    // 记录当前活跃标签页的索引
+                    if (tab == _currentTab)
+                    {
+                        activeTabIndex = sessionTabs.Count - 1;
+                    }
+                }
+
+                ConfigManager.SaveSession(sessionTabs, activeTabIndex);
+                System.Diagnostics.Debug.WriteLine($"已保存会话：{sessionTabs.Count}个标签页");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"保存会话失败: {ex.Message}");
+            }
+        }
+
+        #endregion
+
+                }
+
+                ConfigManager.SaveSession(sessionTabs, activeTabIndex);
+                System.Diagnostics.Debug.WriteLine($"已保存会话：{sessionTabs.Count}个标签页");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"保存会话失败: {ex.Message}");
+            }
+        }
+
+        #endregion
+
+        #region 文件对比功能
+
+        /// <summary>
+        /// 打开文件对比窗口
+        /// </summary>
+        private void FileCompare()
+        {
+            try
+            {
+                var compareWindow = new FileCompareWindow
+                {
+                    Owner = this
+                };
+                compareWindow.Show();
+                UpdateStatus("已打开文件对比窗口");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"打开对比窗口失败: {ex.Message}", "错误");
+                System.Diagnostics.Debug.WriteLine($"文件对比错误: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// 对比当前打开的文件
+        /// </summary>
+        private void CompareCurrentFiles()
+        {
+            try
+            {
+                if (_tabItems.Count < 2)
+                {
+                    MessageBox.Show("至少需要打开两个文件才能进行对比", "提示", 
+                        MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+
+                // 直接对比最后两个打开的文件
+                var leftTab = _tabItems[_tabItems.Count - 2];
+                var rightTab = _tabItems[_tabItems.Count - 1];
+
+                var leftTitle = string.IsNullOrEmpty(leftTab.FilePath) ? leftTab.FileName : Path.GetFileName(leftTab.FilePath);
+                var rightTitle = string.IsNullOrEmpty(rightTab.FilePath) ? rightTab.FileName : Path.GetFileName(rightTab.FilePath);
+
+                var compareWindow = new FileCompareWindow(
+                    leftTab.Content, 
+                    rightTab.Content, 
+                    leftTitle, 
+                    rightTitle)
+                {
+                    Owner = this
+                };
+                compareWindow.Show();
+                UpdateStatus($"已开始对比: {leftTitle} vs {rightTitle}");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"对比当前文件失败: {ex.Message}", "错误");
+                System.Diagnostics.Debug.WriteLine($"对比当前文件错误: {ex}");
+            }
+        }
+
+        #endregion
+
+        #region 菜单和工具栏事件
+
+        private void NewFile_Click(object sender, RoutedEventArgs e) => NewFile();
+        private void OpenFile_Click(object sender, RoutedEventArgs e) => OpenFile();
+        private void SaveFile_Click(object sender, RoutedEventArgs e) => SaveFile();
+        private void SaveAsFile_Click(object sender, RoutedEventArgs e) => SaveAsFile();
+        private void SaveAllFiles_Click(object sender, RoutedEventArgs e) => SaveAllFiles();
+        private void Exit_Click(object sender, RoutedEventArgs e) => Close();
+        
+        private void Find_Click(object sender, RoutedEventArgs e) => ShowFindDialog();
+        private void FindReplace_Click(object sender, RoutedEventArgs e) => ShowFindReplaceDialog();
+        private void BackupManager_Click(object sender, RoutedEventArgs e) => ShowBackupManager();
+        
+        private void ShowFindDialog()
+        {
+            if (_currentTab?.TextEditor != null)
+            {
+                var findDialog = new FindReplaceWindow(_currentTab.TextEditor)
+                {
+                    Owner = this
+                };
+                findDialog.ShowDialog();
+            }
+            else if (WelcomeTextEditor != null)
+            {
+                var findDialog = new FindReplaceWindow(WelcomeTextEditor)
+                {
+                    Owner = this
+                };
+                findDialog.ShowDialog();
+            }
+        }
+        
+        private void ShowFindReplaceDialog()
+        {
+            ShowFindDialog(); // 当前实现中查找和替换在同一窗口
+        }
+        
+        private void FindNext()
+        {
+            // F3快捷键查找下一个
+            // 这里可以实现连续查找功能
+            System.Diagnostics.Debug.WriteLine("查找下一个");
+        }
+        
+        private async void ShowBackupManager()
+        {
+            try
+            {
+                var backupManager = new BackupManagerWindow(_currentTab?.FilePath)
+                {
+                    Owner = this
+                };
+                backupManager.ShowDialog();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"打开备份管理器失败: {ex.Message}", "错误");
+            }
+        }
+
+        // 标签页相关事件
+        private void CloseCurrentTab_Click(object sender, RoutedEventArgs e)
+        {
+            if (_currentTab != null) CloseTab(_currentTab);
+        }
+
+        private void CloseAllTabs_Click(object sender, RoutedEventArgs e)
+        {
+            var tabsToClose = _tabItems.ToList();
+            foreach (var tab in tabsToClose)
+            {
+                CloseTab(tab);
+            }
+        }
+
+        private void CloseOtherTabs_Click(object sender, RoutedEventArgs e)
+        {
+            if (_currentTab == null) return;
+            
+            var tabsToClose = _tabItems.Where(t => t != _currentTab).ToList();
+            foreach (var tab in tabsToClose)
+            {
+                CloseTab(tab);
+            }
+        }
+
+        private void NextTab_Click(object sender, RoutedEventArgs e)
+        {
+            if (_tabItems.Count <= 1) return;
+            
+            var currentIndex = _tabItems.IndexOf(_currentTab);
+            var nextIndex = (currentIndex + 1) % _tabItems.Count;
+            SwitchToTab(_tabItems[nextIndex]);
+        }
+
+        private void PreviousTab_Click(object sender, RoutedEventArgs e)
+        {
+            if (_tabItems.Count <= 1) return;
+            
+            var currentIndex = _tabItems.IndexOf(_currentTab);
+            var previousIndex = currentIndex == 0 ? _tabItems.Count - 1 : currentIndex - 1;
+            SwitchToTab(_tabItems[previousIndex]);
+        }
+
+        private void FileTabControl_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            var tabControl = sender as TabControl;
+            if (tabControl.SelectedItem is TabItem selectedTab && selectedTab.DataContext is FileTabItem tab)
+            {
+                _currentTab = tab;
+                UpdateTitle();
+                UpdateCursorPosition();
+                UpdateSelectionInfo();
+                EncodingText.Text = tab.Encoding;
+            }
+        }
+
+        private void FileTabControl_RightClick(object sender, MouseButtonEventArgs e)
+        {
+            // 获取右键点击的标签页
+            var tabControl = sender as TabControl;
+            var hitTest = e.OriginalSource as FrameworkElement;
+            
+            // 向上查找到TabItem
+            while (hitTest != null && !(hitTest is TabItem))
+            {
+                hitTest = hitTest.Parent as FrameworkElement ?? 
+                         System.Windows.Media.VisualTreeHelper.GetParent(hitTest) as FrameworkElement;
+            }
+            
+            if (hitTest is TabItem tabItem)
+            {
+                // 先选中被右键点击的标签页
+                tabControl.SelectedItem = tabItem;
+                
+                // 显示右键菜单
+                TabContextMenu.IsOpen = true;
+                e.Handled = true;
+            }
+        }
+
+        private void FileTabControl_DoubleClick(object sender, MouseButtonEventArgs e)
+        {
+            // 获取双击位置
+            var tabControl = sender as TabControl;
+            var hitTest = e.OriginalSource as FrameworkElement;
+            
+            // 检查是否点击在标签页上
+            var originalHitTest = hitTest;
+            while (hitTest != null && !(hitTest is TabItem))
+            {
+                hitTest = hitTest.Parent as FrameworkElement ?? 
+                         System.Windows.Media.VisualTreeHelper.GetParent(hitTest) as FrameworkElement;
+            }
+            
+            // 如果没有点击在标签页上，说明点击的是空白区域
+            if (hitTest == null)
+            {
+                // 确保点击的是 TabControl 的空白区域，而不是其他控件
+                if (originalHitTest == tabControl || 
+                    (originalHitTest != null && originalHitTest.GetType().Name.Contains("TabPanel")))
+                {
+                    // 双击空白区域，创建新文件
+                    CreateNewTab();
+                    UpdateStatus("已创建新文件（双击空白区域）");
+                    e.Handled = true;
+                }
+            }
+        }
+
+        // 文件对比相关事件
+        private void FileCompare_Click(object sender, RoutedEventArgs e)
+        {
+            FileCompare();
+        }
+
+        private void CompareCurrentFiles_Click(object sender, RoutedEventArgs e)
+        {
+            CompareCurrentFiles();
+        }
+
+        private void DetectEncoding_Click(object sender, RoutedEventArgs e) => DetectEncoding();
+        private void ConvertEncoding_Click(object sender, RoutedEventArgs e) => ConvertEncoding();
+
+        private void ConvertToUtf8_Click(object sender, RoutedEventArgs e)
+        {
+            if (_currentTab != null)
+            {
+                _currentTab.Encoding = "UTF-8";
+                _currentTab.Content = _currentTab.TextEditor.Text;
+                EncodingText.Text = "UTF-8";
+                UpdateStatus("编码已设置为: UTF-8");
+            }
+        }
+
+        private void ConvertToGbk_Click(object sender, RoutedEventArgs e)
+        {
+            if (_currentTab != null)
+            {
+                _currentTab.Encoding = "GBK";
+                _currentTab.Content = _currentTab.TextEditor.Text;
+                EncodingText.Text = "GBK";
+                UpdateStatus("编码已设置为: GBK");
+            }
+        }
+
+        private void ConvertToUtf16_Click(object sender, RoutedEventArgs e)
+        {
+            if (_currentTab != null)
+            {
+                _currentTab.Encoding = "UTF-16";
+                _currentTab.Content = _currentTab.TextEditor.Text;
+                EncodingText.Text = "UTF-16";
+                UpdateStatus("编码已设置为: UTF-16");
+            }
+        }
+
+        private void About_Click(object sender, RoutedEventArgs e)
+        {
+            var aboutText = "Smart Text Editor v1.2\n\n" +
+                           "一款基于C#和WPF开发的智能文本编辑器\n" +
+                           "支持多标签页编辑和智能编码管理\n\n" +
+                           "最新功能：\n" +
+                           "• 多主题系统 - 6种精美主题任您选择\n" +
+                           "• 多标签页编辑界面\n" +
+                           "• 智能文件管理\n" +
+                           "• 文件对比功能\n" +
+                           "• 现代化用户体验\n" +
+                           "• 高性能.NET运行时\n\n" +
+                           "支持主题：\n" +
+                           "• 深色主题 - GitHub Dark风格\n" +
+                           "• 浅色主题 - 清新明亮配色\n" +
+                           "• 高对比度 - 视觉障碍友好\n" +
+                           "• 护眼主题 - 暖色调护眼配色\n" +
+                           "• Monokai - 经典程序员主题\n" +
+                           "• Solarized - 科学配色方案\n\n" +
+                           "版权所有 © 2024 Smart Text Editor Team";
+
+            MessageBox.Show(aboutText, "关于 Smart Text Editor",
+                MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+
+        #endregion
+
+        #region 主题管理
+
+        private void SetDarkTheme_Click(object sender, RoutedEventArgs e)
+        {
+            PreviewAndSetTheme(ThemeType.Dark);
+        }
+
+        private void SetLightTheme_Click(object sender, RoutedEventArgs e)
+        {
+            PreviewAndSetTheme(ThemeType.Light);
+        }
+
+        private void SetHighContrastTheme_Click(object sender, RoutedEventArgs e)
+        {
+            PreviewAndSetTheme(ThemeType.HighContrast);
+        }
+
+        private void SetEyeCareTheme_Click(object sender, RoutedEventArgs e)
+        {
+            PreviewAndSetTheme(ThemeType.EyeCare);
+        }
+
+        private void SetMonokaiTheme_Click(object sender, RoutedEventArgs e)
+        {
+            PreviewAndSetTheme(ThemeType.Monokai);
+        }
+
+        private void SetSolarizedTheme_Click(object sender, RoutedEventArgs e)
+        {
+            PreviewAndSetTheme(ThemeType.Solarized);
+        }
+
+        /// <summary>
+        /// 预览并设置主题
+        /// </summary>
+        private void PreviewAndSetTheme(ThemeType themeType)
+        {
+            try
+            {
+                // 如果正在预览其他主题，先恢复当前主题
+                if (_isPreviewingTheme && _previewTheme != ThemeManager.CurrentTheme)
+                {
+                    // 恢复当前主题
+                    ApplyThemeToUI(ThemeManager.CurrentTheme);
+                }
+                
+                // 应用预览主题
+                ApplyThemeToUI(themeType);
+                
+                // 设置预览状态
+                _previewTheme = themeType;
+                _isPreviewingTheme = true;
+                
+                // 3秒后自动确认或恢复
+                var timer = new DispatcherTimer
+                {
+                    Interval = TimeSpan.FromSeconds(3)
+                };
+                timer.Tick += (s, e) =>
+                {
+                    timer.Stop();
+                    if (_isPreviewingTheme)
+                    {
+                        ConfirmTheme(themeType);
+                    }
+                };
+                timer.Start();
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"主题预览失败: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"主题预览错误: {ex}");
+            }
+        }
+        
+        /// <summary>
+        /// 应用主题到UI（预览或正式应用）
+        /// </summary>
+        private void ApplyThemeToUI(ThemeType themeType)
+        {
+            var themeColors = ThemeManager.GetThemeColors(themeType);
+            
+            // 应用主题到主窗口
+            ThemeApplier.ApplyThemeToMainWindow(this, themeColors);
+            
+            // 应用主题到所有标签页
+            foreach (var tabItem in _tabItems)
+            {
+                ThemeApplier.ApplyToTabItem(tabItem, themeColors);
+            }
+            
+            // 更新菜单选中状态（预览时不更新）
+            if (!_isPreviewingTheme || themeType == ThemeManager.CurrentTheme)
+            {
+                UpdateThemeMenuSelection(themeType);
+            }
+        }
+        
+        /// <summary>
+        /// 确认主题选择
+        /// </summary>
+        private void ConfirmTheme(ThemeType themeType)
+        {
+            try
+            {
+                // 设置主题
+                ThemeManager.SetTheme(themeType);
+                var themeColors = ThemeManager.GetCurrentThemeColors();
+                
+                // 应用主题到主窗口
+                ThemeApplier.ApplyThemeToMainWindow(this, themeColors);
+                
+                // 应用主题到所有标签页
+                foreach (var tabItem in _tabItems)
+                {
+                    ThemeApplier.ApplyToTabItem(tabItem, themeColors);
+                }
+                
+                // 更新菜单选中状态
+                UpdateThemeMenuSelection(themeType);
+                
+                // 保存主题设置
+                ConfigManager.SaveTheme(themeType);
+                
+                // 重置预览状态
+                _isPreviewingTheme = false;
+                
+                // 更新状态
+                UpdateStatus($"主题已切换为: {themeColors.Name}，已保存设置");
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"主题切换失败: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"主题切换错误: {ex}");
+            }
+        }
+
+        private void SetTheme(ThemeType themeType)
+        {
+            try
+            {
+                // 设置主题
+                ThemeManager.SetTheme(themeType);
+                var themeColors = ThemeManager.GetCurrentThemeColors();
+
+                // 应用主题到主窗口
+                ThemeApplier.ApplyThemeToMainWindow(this, themeColors);
+
+                // 应用主题到所有标签页
+                foreach (var tabItem in _tabItems)
+                {
+                    ThemeApplier.ApplyToTabItem(tabItem, themeColors);
+                }
+
+                // 更新菜单选中状态
+                UpdateThemeMenuSelection(themeType);
+
+                // 保存主题设置
+                ConfigManager.SaveTheme(themeType);
+
+                // 更新状态
+                UpdateStatus($"主题已切换为: {themeColors.Name}，已保存设置");
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"主题切换失败: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"主题切换错误: {ex}");
+            }
+        }
+
+        private void UpdateThemeMenuSelection(ThemeType selectedTheme)
+        {
+            // 取消所有主题菜单项的选中状态
+            DarkThemeMenuItem.IsChecked = false;
+            LightThemeMenuItem.IsChecked = false;
+            HighContrastThemeMenuItem.IsChecked = false;
+            EyeCareThemeMenuItem.IsChecked = false;
+            MonokaiThemeMenuItem.IsChecked = false;
+            SolarizedThemeMenuItem.IsChecked = false;
+
+            // 设置当前主题菜单项为选中状态
+            switch (selectedTheme)
+            {
+                case ThemeType.Dark:
+                    DarkThemeMenuItem.IsChecked = true;
+                    break;
+                case ThemeType.Light:
+                    LightThemeMenuItem.IsChecked = true;
+                    break;
+                case ThemeType.HighContrast:
+                    HighContrastThemeMenuItem.IsChecked = true;
+                    break;
+                case ThemeType.EyeCare:
+                    EyeCareThemeMenuItem.IsChecked = true;
+                    break;
+                case ThemeType.Monokai:
+                    MonokaiThemeMenuItem.IsChecked = true;
+                    break;
+                case ThemeType.Solarized:
+                    SolarizedThemeMenuItem.IsChecked = true;
+                    break;
+            }
+            
+            // 同时更新工具栏上的ComboBox选择
+            UpdateThemeComboBox(selectedTheme);
+        }
+        
+        private void UpdateThemeComboBox(ThemeType selectedTheme)
+        {
+            if (ThemeSelector == null) return;
+            
+            // 临时移除事件处理器，避免循环触发
+            ThemeSelector.SelectionChanged -= ThemeSelector_SelectionChanged;
+            
+            var themeTag = selectedTheme.ToString();
+            foreach (ComboBoxItem item in ThemeSelector.Items)
+            {
+                if (item.Tag?.ToString() == themeTag)
+                {
+                    ThemeSelector.SelectedItem = item;
+                    break;
+                }
+            }
+            
+            // 重新添加事件处理器
+            ThemeSelector.SelectionChanged += ThemeSelector_SelectionChanged;
+        }
+        
+        private void ThemeSelector_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            // 防止在初始化过程中触发
+            if (!_isFullyInitialized || sender is not ComboBox comboBox || comboBox.SelectedItem is not ComboBoxItem selectedItem)
+                return;
+                
+            var themeTag = selectedItem.Tag?.ToString();
+            if (Enum.TryParse<ThemeType>(themeTag, out var themeType))
+            {
+                SetTheme(themeType);
+            }
+        }
+
+        #endregion
+
+        #region 辅助方法
+
+        private static T FindParent<T>(DependencyObject child) where T : DependencyObject
+        {
+            var parent = VisualTreeHelper.GetParent(child);
+            if (parent == null) return null;
+            return parent is T ? (T)parent : FindParent<T>(parent);
+        }
+
+        #endregion
+    }
+}
