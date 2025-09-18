@@ -230,11 +230,11 @@ namespace SmartTextEditor.Services
                 if (!Directory.Exists(BackupDirectory))
                     return (0, 0, DateTime.MinValue);
 
-                var backupFiles = Directory.GetFiles(BackupDirectory, "*.bak");
+                var backupFiles = await Task.Run(() => Directory.GetFiles(BackupDirectory, "*.bak"));
                 var totalBackups = backupFiles.Length;
-                var totalSize = backupFiles.Sum(f => new FileInfo(f).Length);
-                var lastBackup = backupFiles.Length > 0 ? 
-                    backupFiles.Max(f => File.GetCreationTime(f)) : DateTime.MinValue;
+                var totalSize = await Task.Run(() => backupFiles.Sum(f => new FileInfo(f).Length));
+                var lastBackup = await Task.Run(() => backupFiles.Length > 0 ? 
+                    backupFiles.Max(f => File.GetCreationTime(f)) : DateTime.MinValue);
 
                 return (totalBackups, totalSize, lastBackup);
             }
@@ -268,7 +268,7 @@ namespace SmartTextEditor.Services
         /// <summary>
         /// 从元数据文件读取备份信息
         /// </summary>
-        private static async Task<BackupInfo> GetBackupInfoAsync(string backupFilePath)
+        public static async Task<BackupInfo> GetBackupInfoAsync(string backupFilePath)
         {
             try
             {
@@ -307,7 +307,7 @@ namespace SmartTextEditor.Services
                 var metaFile = backupFilePath + ".meta";
                 if (File.Exists(metaFile))
                 {
-                    File.Delete(metaFile);
+                    await Task.Run(() => File.Delete(metaFile));
                 }
             }
             catch (Exception ex)

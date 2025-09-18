@@ -116,7 +116,7 @@ namespace SmartTextEditor
         private void CreateMinimalWelcomeTab()
         {
             // 极简欢迎页，只显示基本信息
-            var welcomeContent = "🚀 Smart Text Editor - 正在加载...";
+            var welcomeContent = "🚀 Smart Text Editor - 欢迎光临...";
 
             var welcomeTab = new FileTabItem
             {
@@ -132,10 +132,41 @@ namespace SmartTextEditor
             if (WelcomeTextEditor != null)
             {
                 WelcomeTextEditor.Text = welcomeContent;
+                // 添加基本事件处理，防止初始化失败
+                WelcomeTextEditor.TextChanged -= WelcomeTextEditor_TextChanged;
+                WelcomeTextEditor.TextChanged += WelcomeTextEditor_TextChanged;
+                
+                WelcomeTextEditor.SelectionChanged -= WelcomeTextEditor_SelectionChanged;
+                WelcomeTextEditor.SelectionChanged += WelcomeTextEditor_SelectionChanged;
             }
             if (WelcomeLineNumbers != null)
             {
                 UpdateLineNumbers(WelcomeLineNumbers, WelcomeTextEditor);
+            }
+        }
+
+        private void WelcomeTextEditor_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            try
+            {
+                OnCurrentTabTextChanged();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"欢迎页文本变化事件错误: {ex.Message}");
+            }
+        }
+
+        private void WelcomeTextEditor_SelectionChanged(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                UpdateCursorPosition();
+                UpdateSelectionInfo();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"欢迎页选择变化事件错误: {ex.Message}");
             }
         }
         
@@ -179,24 +210,47 @@ namespace SmartTextEditor
 
 🚀 享受无缝的工作体验吧！";
 
+            // 确保在UI线程上执行更新操作
+            if (Dispatcher.CheckAccess())
+            {
+                UpdateWelcomeContent(fullWelcomeContent);
+            }
+            else
+            {
+                Dispatcher.Invoke(() => UpdateWelcomeContent(fullWelcomeContent));
+            }
+        }
+
+        private void UpdateWelcomeContent(string content)
+        {
             if (_currentTab != null && _currentTab.FileName == "欢迎")
             {
-                _currentTab.Content = fullWelcomeContent;
-                _currentTab.OriginalContent = fullWelcomeContent;
-                WelcomeTextEditor.Text = fullWelcomeContent;
+                _currentTab.Content = content;
+                _currentTab.OriginalContent = content;
                 
-                // 设置事件处理
-                WelcomeTextEditor.TextChanged += (s, e) => OnCurrentTabTextChanged();
-                WelcomeTextEditor.SelectionChanged += (s, e) => {
+                if (WelcomeTextEditor != null)
+                {
+                    WelcomeTextEditor.Text = content;
+                    
+                    // 确保事件处理只添加一次
+                    WelcomeTextEditor.TextChanged -= WelcomeTextEditor_TextChanged;
+                    WelcomeTextEditor.SelectionChanged -= WelcomeTextEditor_SelectionChanged;
+                    
+                    // 设置事件处理
+                    WelcomeTextEditor.TextChanged += WelcomeTextEditor_TextChanged;
+                    WelcomeTextEditor.SelectionChanged += WelcomeTextEditor_SelectionChanged;
+                    
+                    UpdateLineNumbers(WelcomeLineNumbers, WelcomeTextEditor);
                     UpdateCursorPosition();
                     UpdateSelectionInfo();
-                };
-                WelcomeTextEditor.PreviewKeyDown += TextEditor_PreviewKeyDown;
-                
-                UpdateLineNumbers(WelcomeLineNumbers, WelcomeTextEditor);
-                UpdateCursorPosition();
-                UpdateSelectionInfo();
+                }
             }
+        }
+
+        private void UpdateCursorPositionAndSelection()
+        {
+            UpdateCursorPosition();
+            UpdateSelectionInfo();
         }
 
         private void InitializeEditor()
@@ -254,147 +308,150 @@ namespace SmartTextEditor
         #region 标签页管理
 
         private void CreateNewTab(string fileName = null, string content = "")
-        {
-            try
-            {
-                System.Diagnostics.Debug.WriteLine($"CreateNewTab called with fileName: {fileName}, content length: {content?.Length ?? 0}");
-
-                var tabItem = new FileTabItem
                 {
-                    FileName = fileName ?? $"无标题{_newFileCounter++}",
-                    Content = content,
-                    Encoding = "UTF-8"
-                };
-                tabItem.OriginalContent = content;
-
-                // 获取TabControl
-                var tabControl = FileTabControl;
-                System.Diagnostics.Debug.WriteLine($"FileTabControl reference: {tabControl != null}");
-                if (tabControl == null)
-                {
-                    var error = "无法找到标签页控件(FileTabControl)";
-                    System.Diagnostics.Debug.WriteLine(error);
-                    MessageBox.Show(error, "错误");
-                    return;
-                }
-
-                // 创建新的标签页UI
-                var newTabItem = new TabItem
-                {
-                    Header = tabItem.DisplayName,
-                    DataContext = tabItem
-                };
-
-                // 创建编辑器内容
-                var grid = new Grid();
-                grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto, MinWidth = 35 });
-                grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-
-                var lineNumbers = new TextBox
-                {
-                    Background = new SolidColorBrush(Color.FromRgb(0x16, 0x1B, 0x22)),
-                    Foreground = new SolidColorBrush(Color.FromRgb(0x7D, 0x85, 0x90)),
-                    BorderThickness = new Thickness(0, 0, 1, 0),
-                    BorderBrush = new SolidColorBrush(Color.FromRgb(0x30, 0x36, 0x3D)),
-                    FontFamily = new FontFamily("Consolas"),
-                    FontSize = 13,
-                    IsReadOnly = true,
-                    IsTabStop = false,
-                    VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
-                    HorizontalScrollBarVisibility = ScrollBarVisibility.Hidden,
-                    TextAlignment = TextAlignment.Right,
-                    Padding = new Thickness(8, 12, 8, 12),
-                    Width = 35,
-                    MinWidth = 35
-                };
-
-                var textEditor = new TextBox
-                {
-                    Background = new SolidColorBrush(Color.FromRgb(0x0D, 0x11, 0x17)),
-                    Foreground = new SolidColorBrush(Color.FromRgb(0xE6, 0xED, 0xF3)),
-                    BorderBrush = new SolidColorBrush(Color.FromRgb(0x30, 0x36, 0x3D)),
-                    BorderThickness = new Thickness(1),
-                    FontFamily = new FontFamily("Consolas"),
-                    FontSize = 14,
-                    Padding = new Thickness(12),
-                    AcceptsReturn = true,
-                    AcceptsTab = true,
-                    VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                    HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
-                    TextWrapping = TextWrapping.NoWrap,
-                    Text = content
-                };
-
-                // 绑定事件
-                textEditor.TextChanged += (s, e) => {
-                    try {
-                        OnTabTextChanged(tabItem, textEditor);
-                    } catch (Exception ex) {
-                        System.Diagnostics.Debug.WriteLine($"文本变化事件错误: {ex.Message}");
-                    }
-                };
-                textEditor.SelectionChanged += (s, e) => {
-                    try {
-                        UpdateCursorPosition();
-                        UpdateSelectionInfo();
-                    } catch (Exception ex) {
-                        System.Diagnostics.Debug.WriteLine($"选择变化事件错误: {ex.Message}");
-                    }
-                };
-                textEditor.PreviewKeyDown += TextEditor_PreviewKeyDown;
-                
-                // 添加滚动同步事件 - 使用附加属性
-                textEditor.AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler((s, e) => {
-                    try {
-                        // 同步行号滚动
-                        if (lineNumbers != null)
+                    try
+                    {
+                        System.Diagnostics.Debug.WriteLine($"CreateNewTab called with fileName: {fileName}, content length: {content?.Length ?? 0}");
+        
+                        var tabItem = new FileTabItem
                         {
-                            lineNumbers.ScrollToVerticalOffset(e.VerticalOffset);
+                            FileName = fileName ?? $"无标题{_newFileCounter++}",
+                            Encoding = "UTF-8"
+                        };
+                        tabItem.Content = content ?? "";
+                        tabItem.OriginalContent = content ?? "";
+        
+                        // 获取TabControl
+                        var tabControl = FileTabControl;
+                        System.Diagnostics.Debug.WriteLine($"FileTabControl reference: {tabControl != null}");
+                        if (tabControl == null)
+                        {
+                            var error = "无法找到标签页控件(FileTabControl)";
+                            System.Diagnostics.Debug.WriteLine(error);
+                            MessageBox.Show(error, "错误");
+                            return;
                         }
-                    } catch (Exception ex) {
-                        System.Diagnostics.Debug.WriteLine($"滚动同步错误: {ex.Message}");
+        
+                        // 创建新的标签页UI
+                        var newTabItem = new TabItem
+                        {
+                            Header = tabItem.DisplayName,
+                            DataContext = tabItem
+                        };
+        
+                        // 创建编辑器内容
+                        var grid = new Grid();
+                        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto, MinWidth = 35 });
+                        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        
+                        var lineNumbers = new TextBox
+                        {
+                            Background = new SolidColorBrush(Color.FromRgb(0x16, 0x1B, 0x22)),
+                            Foreground = new SolidColorBrush(Color.FromRgb(0x7D, 0x85, 0x90)),
+                            BorderThickness = new Thickness(0, 0, 1, 0),
+                            BorderBrush = new SolidColorBrush(Color.FromRgb(0x30, 0x36, 0x3D)),
+                            FontFamily = new FontFamily("Consolas"),
+                            FontSize = 13,
+                            IsReadOnly = true,
+                            IsTabStop = false,
+                            VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
+                            HorizontalScrollBarVisibility = ScrollBarVisibility.Hidden,
+                            TextAlignment = TextAlignment.Right,
+                            Padding = new Thickness(8, 12, 8, 12),
+                            Width = 35,
+                            MinWidth = 35
+                        };
+        
+                        var textEditor = new TextBox
+                        {
+                            Background = new SolidColorBrush(Color.FromRgb(0x0D, 0x11, 0x17)),
+                            Foreground = new SolidColorBrush(Color.FromRgb(0xE6, 0xED, 0xF3)),
+                            BorderBrush = new SolidColorBrush(Color.FromRgb(0x30, 0x36, 0x3D)),
+                            BorderThickness = new Thickness(1),
+                            FontFamily = new FontFamily("Consolas"),
+                            FontSize = 14,
+                            Padding = new Thickness(12),
+                            AcceptsReturn = true,
+                            AcceptsTab = true,
+                            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+                            TextWrapping = TextWrapping.NoWrap,
+                            Text = content ?? ""
+                        };
+        
+                        // 绑定事件
+                        textEditor.TextChanged += (s, e) => {
+                            try {
+                                OnTabTextChanged(tabItem, textEditor);
+                            } catch (Exception ex) {
+                                System.Diagnostics.Debug.WriteLine($"文本变化事件错误: {ex.Message}");
+                            }
+                        };
+                        textEditor.SelectionChanged += (s, e) => {
+                            try {
+                                UpdateCursorPosition();
+                                UpdateSelectionInfo();
+                            } catch (Exception ex) {
+                                System.Diagnostics.Debug.WriteLine($"选择变化事件错误: {ex.Message}");
+                            }
+                        };
+                        textEditor.PreviewKeyDown += TextEditor_PreviewKeyDown;
+                        
+                        // 添加滚动同步事件 - 使用附加属性
+                        if (textEditor != null && lineNumbers != null)
+                        {
+                            textEditor.AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler((s, e) => {
+                                try {
+                                    // 同步行号滚动
+                                    if (lineNumbers != null)
+                                    {
+                                        lineNumbers.ScrollToVerticalOffset(e.VerticalOffset);
+                                    }
+                                } catch (Exception ex) {
+                                    System.Diagnostics.Debug.WriteLine($"滚动同步错误: {ex.Message}");
+                                }
+                            }));
+                        }
+        
+                        // 设置控件引用
+                        tabItem.TextEditor = textEditor;
+                        tabItem.LineNumbersEditor = lineNumbers;
+        
+                        Grid.SetColumn(lineNumbers, 0);
+                        Grid.SetColumn(textEditor, 1);
+                        grid.Children.Add(lineNumbers);
+                        grid.Children.Add(textEditor);
+        
+                        newTabItem.Content = grid;
+                        _tabItems.Add(tabItem);
+        
+                        // 添加到TabControl
+                        System.Diagnostics.Debug.WriteLine($"Adding tab item to FileTabControl");
+                        tabControl.Items.Add(newTabItem);
+                        tabControl.SelectedItem = newTabItem;
+        
+                        _currentTab = tabItem;
+                        UpdateLineNumbers(lineNumbers, textEditor);
+                        UpdateTitle();
+                        UpdateTabList();
+                        
+                        // 应用当前主题到新标签页
+                        if (_isFullyInitialized)
+                        {
+                            var currentTheme = ThemeManager.GetCurrentThemeColors();
+                            ThemeApplier.ApplyToTabItem(tabItem, currentTheme);
+                        }
+                        
+                        UpdateStatus($"已创建新标签页: {tabItem.FileName}");
+                        System.Diagnostics.Debug.WriteLine($"Successfully created new tab: {tabItem.FileName}");
                     }
-                }));
-
-                // 设置控件引用
-                tabItem.TextEditor = textEditor;
-                tabItem.LineNumbersEditor = lineNumbers;
-
-                Grid.SetColumn(lineNumbers, 0);
-                Grid.SetColumn(textEditor, 1);
-                grid.Children.Add(lineNumbers);
-                grid.Children.Add(textEditor);
-
-                newTabItem.Content = grid;
-                _tabItems.Add(tabItem);
-
-                // 添加到TabControl
-                System.Diagnostics.Debug.WriteLine($"Adding tab item to FileTabControl");
-                tabControl.Items.Add(newTabItem);
-                tabControl.SelectedItem = newTabItem;
-
-                _currentTab = tabItem;
-                UpdateLineNumbers(lineNumbers, textEditor);
-                UpdateTitle();
-                UpdateTabList();
-                
-                // 应用当前主题到新标签页
-                if (_isFullyInitialized)
-                {
-                    var currentTheme = ThemeManager.GetCurrentThemeColors();
-                    ThemeApplier.ApplyToTabItem(tabItem, currentTheme);
+                    catch (Exception ex)
+                    {
+                        var errorMessage = $"创建新标签页失败: {ex.Message}\n{ex.StackTrace}";
+                        System.Diagnostics.Debug.WriteLine(errorMessage);
+                        MessageBox.Show(errorMessage, "错误");
+                    }
                 }
-                
-                UpdateStatus($"已创建新标签页: {tabItem.FileName}");
-                System.Diagnostics.Debug.WriteLine($"Successfully created new tab: {tabItem.FileName}");
-            }
-            catch (Exception ex)
-            {
-                var errorMessage = $"创建新标签页失败: {ex.Message}\n{ex.StackTrace}";
-                System.Diagnostics.Debug.WriteLine(errorMessage);
-                MessageBox.Show(errorMessage, "错误");
-            }
-        }
 
         private void CloseTab(FileTabItem tabItem)
         {
@@ -673,6 +730,16 @@ namespace SmartTextEditor
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"更新行号失败: {ex.Message}");
+                // 即使更新失败，也不要让应用程序崩溃
+                try
+                {
+                    // 尝试设置一个简单的默认值
+                    lineNumbersEditor.Text = "1\n";
+                }
+                catch
+                {
+                    // 如果连默认值都无法设置，就忽略这个错误
+                }
             }
         }
 
@@ -772,10 +839,20 @@ namespace SmartTextEditor
         {
             if (tabItem == null || textEditor == null) return;
 
-            tabItem.Content = textEditor.Text;
-            UpdateLineNumbers(tabItem.LineNumbersEditor, textEditor);
-            UpdateCursorPosition();
-            UpdateSelectionInfo();
+            try
+            {
+                tabItem.Content = textEditor.Text ?? "";
+                if (tabItem.LineNumbersEditor != null)
+                {
+                    UpdateLineNumbers(tabItem.LineNumbersEditor, textEditor);
+                }
+                UpdateCursorPosition();
+                UpdateSelectionInfo();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"处理标签页文本变化时出错: {ex.Message}");
+            }
         }
 
         private void OnCurrentTabTextChanged()
@@ -1127,11 +1204,49 @@ namespace SmartTextEditor
                 // 应用主题到主窗口
                 ThemeApplier.ApplyThemeToMainWindow(this, themeColors);
 
-                // 应用主题到所有标签页
+                // 应用主题到所有标签页（模型中的引用）
                 foreach (var tabItem in _tabItems)
                 {
                     ThemeApplier.ApplyToTabItem(tabItem, themeColors);
                 }
+                
+                // 特别处理TabControl中的所有标签页，确保编辑器主题更新
+                if (FileTabControl != null)
+                {
+                    foreach (TabItem tab in FileTabControl.Items)
+                    {
+                        if (tab.Content is Grid grid)
+                        {
+                            TextBox lineNumbers = null;
+                            TextBox textEditor = null;
+                            
+                            // 遍历Grid的子元素查找行号编辑器和主文本编辑器
+                            foreach (var child in grid.Children)
+                            {
+                                if (child is TextBox textBox)
+                                {
+                                    // 根据宽度判断是行号编辑器还是主文本编辑器
+                                    if (textBox.Width <= 35 && textBox.MinWidth <= 35)
+                                    {
+                                        lineNumbers = textBox;
+                                    }
+                                    else
+                                    {
+                                        textEditor = textBox;
+                                    }
+                                }
+                            }
+                            
+                            if (textEditor != null || lineNumbers != null)
+                            {
+                                ThemeApplier.ApplyToTextEditor(textEditor, lineNumbers, themeColors);
+                            }
+                        }
+                    }
+                }
+                
+                // 特别处理欢迎页面编辑器
+                ThemeApplier.ApplyToTextEditor(WelcomeTextEditor, WelcomeLineNumbers, themeColors);
 
                 // 更新菜单选中状态
                 UpdateThemeMenuSelection(themeType);

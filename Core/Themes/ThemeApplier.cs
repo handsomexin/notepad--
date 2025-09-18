@@ -63,35 +63,53 @@ namespace SmartTextEditor.Themes
         {
             try
             {
-                var menuItemStyle = new Style(typeof(MenuItem));
+                // 直接设置菜单的背景和前景色
+                menu.Background = new SolidColorBrush(theme.MenuBackground);
+                menu.Foreground = new SolidColorBrush(theme.TextForeground);
                 
-                // 使用动画背景色
-                var backgroundAnimation = new ColorAnimation
+                // 遍历菜单项并设置样式
+                foreach (var item in menu.Items)
                 {
-                    Duration = TimeSpan.FromMilliseconds(ANIMATION_DURATION_MS),
-                    EasingFunction = new QuadraticEase()
-                };
-                var backgroundBinding = new Binding("Background.Color") { Source = menu };
-                menuItemStyle.Setters.Add(new Setter(Control.BackgroundProperty, 
-                    new SolidColorBrush(theme.MenuBackground)));
-                
-                menuItemStyle.Setters.Add(new Setter(Control.ForegroundProperty, 
-                    new SolidColorBrush(theme.TextForeground)));
-                
-                // 鼠标悬停效果
-                var hoverTrigger = new Trigger();
-                hoverTrigger.Property = UIElement.IsMouseOverProperty;
-                hoverTrigger.Value = true;
-                hoverTrigger.Setters.Add(new Setter(Control.BackgroundProperty, 
-                    new SolidColorBrush(theme.ButtonHoverBackground)));
-                
-                menuItemStyle.Triggers.Add(hoverTrigger);
-                
-                menu.Resources[typeof(MenuItem)] = menuItemStyle;
+                    if (item is MenuItem menuItem)
+                    {
+                        ApplyMenuItemStyle(menuItem, theme);
+                    }
+                }
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"更新菜单样式失败: {ex.Message}");
+            }
+        }
+        
+        /// <summary>
+        /// 应用样式到单个菜单项
+        /// </summary>
+        private static void ApplyMenuItemStyle(MenuItem menuItem, ThemeColors theme)
+        {
+            try
+            {
+                menuItem.Background = new SolidColorBrush(theme.MenuBackground);
+                menuItem.Foreground = new SolidColorBrush(theme.TextForeground);
+                
+                // 设置鼠标悬停效果
+                var trigger = new Trigger { Property = UIElement.IsMouseOverProperty, Value = true };
+                var hoverBackground = new SolidColorBrush(theme.ButtonHoverBackground);
+                trigger.Setters.Add(new Setter(Control.BackgroundProperty, hoverBackground));
+                menuItem.Triggers.Add(trigger);
+                
+                // 递归应用到子菜单项
+                foreach (var subItem in menuItem.Items)
+                {
+                    if (subItem is MenuItem subMenuItem)
+                    {
+                        ApplyMenuItemStyle(subMenuItem, theme);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"应用菜单项样式失败: {ex.Message}");
             }
         }
 
@@ -249,7 +267,7 @@ namespace SmartTextEditor.Themes
                 EasingFunction = new QuadraticEase()
             };
 
-            if (control.Background is SolidColorBrush brush)
+            if (control.Background is SolidColorBrush brush && !brush.IsFrozen)
             {
                 brush.BeginAnimation(SolidColorBrush.ColorProperty, animation);
             }
@@ -273,7 +291,7 @@ namespace SmartTextEditor.Themes
                 EasingFunction = new QuadraticEase()
             };
 
-            if (control.Foreground is SolidColorBrush brush)
+            if (control.Foreground is SolidColorBrush brush && !brush.IsFrozen)
             {
                 brush.BeginAnimation(SolidColorBrush.ColorProperty, animation);
             }
@@ -297,7 +315,7 @@ namespace SmartTextEditor.Themes
                 EasingFunction = new QuadraticEase()
             };
 
-            if (control.BorderBrush is SolidColorBrush brush)
+            if (control.BorderBrush is SolidColorBrush brush && !brush.IsFrozen)
             {
                 brush.BeginAnimation(SolidColorBrush.ColorProperty, animation);
             }
@@ -321,7 +339,7 @@ namespace SmartTextEditor.Themes
                 EasingFunction = new QuadraticEase()
             };
 
-            if (window.Background is SolidColorBrush brush)
+            if (window.Background is SolidColorBrush brush && !brush.IsFrozen)
             {
                 brush.BeginAnimation(SolidColorBrush.ColorProperty, animation);
             }
@@ -345,7 +363,7 @@ namespace SmartTextEditor.Themes
                 EasingFunction = new QuadraticEase()
             };
 
-            if (textBox.SelectionBrush is SolidColorBrush brush)
+            if (textBox.SelectionBrush is SolidColorBrush brush && !brush.IsFrozen)
             {
                 brush.BeginAnimation(SolidColorBrush.ColorProperty, animation);
             }

@@ -216,21 +216,6 @@ namespace SmartTextEditor.Services
                 var gbkEncoding = Encoding.GetEncoding("GBK");
                 var text = gbkEncoding.GetString(bytes);
                 
-                // 检查是否包含中文字符范围
-                foreach (char c in text)
-                {
-                    // 中文字符Unicode范围
-                    if ((c >= 0x4E00 && c <= 0x9FFF) ||  // CJK统一汉字
-                        (c >= 0x3400 && c <= 0x4DBF) ||  // CJK扩展A
-                        (c >= 0x20000 && c <= 0x2A6DF) || // CJK扩展B
-                        (c >= 0x2A700 && c <= 0x2B73F) || // CJK扩展C
-                        (c >= 0x2B740 && c <= 0x2B81F) || // CJK扩展D
-                        (c >= 0x2B820 && c <= 0x2CEAF))   // CJK扩展E
-                    {
-                        return true;
-                    }
-                }
-                
                 // 如果Unicode检测失败，回退到字节范围检测
                 for (int i = 0; i < bytes.Length - 1; i++)
                 {

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
@@ -102,10 +103,27 @@ namespace SmartTextEditor.Windows
         {
             try
             {
-                // 这里可以实现加载所有备份的功能
-                // 暂时显示空列表
+                // 实现加载所有备份的功能
+                var backupDir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), 
+                    "SmartTextEditor", "Backups");
+                
                 _backups = new List<BackupManager.BackupInfo>();
-                BackupDataGrid.ItemsSource = _backups;
+                
+                if (Directory.Exists(backupDir))
+                {
+                    var backupFiles = Directory.GetFiles(backupDir, "*.bak");
+                    foreach (var backupFile in backupFiles)
+                    {
+                        var info = await BackupManager.GetBackupInfoAsync(backupFile);
+                        if (info != null)
+                        {
+                            _backups.Add(info);
+                        }
+                    }
+                }
+                
+                BackupDataGrid.ItemsSource = _backups.OrderByDescending(b => b.CreateTime).ToList();
             }
             catch (Exception ex)
             {

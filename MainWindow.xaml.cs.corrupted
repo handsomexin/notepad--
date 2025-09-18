@@ -281,7 +281,7 @@ namespace SmartTextEditor
         private void CreateMinimalWelcomeTab()
         {
             // 极简欢迎页，只显示基本信息
-            var welcomeContent = "🚀 Smart Text Editor - 正在加载...";
+            var welcomeContent = "🚀 Smart Text Editor - 欢迎光临";
 
             var welcomeTab = new FileTabItem
             {
